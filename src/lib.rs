@@ -13,4 +13,15 @@ impl KvStore {
 
         KvStore { db: thread_safe_db }
     }
+
+    pub fn set(&self, key: String, value: Vec<u8>) {
+        let mut lock = self.db.write().unwrap();
+        lock.insert(key, value);
+    }
+
+    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let lock = self.db.read().unwrap();
+        let value = lock.get(key);
+        return value.cloned()
+    }
 }
