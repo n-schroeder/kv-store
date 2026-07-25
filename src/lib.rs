@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use serde::{Serialize, Deserialize};
 
 #[derive(Clone)]
 pub struct KvStore {
@@ -27,10 +28,16 @@ impl KvStore {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum Command {
+    Set { key: String, value: Vec<u8> },
+    Get { key: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{assert_eq, thread};
 
     #[test]
     fn test_concurrent_inserts() {
@@ -60,5 +67,18 @@ mod tests {
             let actual_value = store.get(&key).expect("Key should exist");
             assert_eq!(actual_value, expected_value, "Data mismatch for key: {}", key);
         }
+    }
+
+    #[test]
+    fn test_serialization() {
+        let original_cmd = Command::Set {
+            key: "some_data".to_string(),
+            value: vec![99, 100, 101],
+        };
+
+        let network_bytes = bincode::serialize(&original_cmd).unwrap();
+        let rebuilt_cmd: Command = bincode::deserialize(&network_bytes).unwrap();
+
+        assert_eq!(original_cmd, rebuilt_cmd);
     }
 }
