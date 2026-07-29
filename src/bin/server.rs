@@ -1,4 +1,4 @@
-use std::{net::TcpListener, print, println};
+use std::net::TcpListener;
 use std::io::Read;
 use kv_store::{KvStore, Command};
 
