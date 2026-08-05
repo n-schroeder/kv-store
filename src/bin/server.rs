@@ -1,6 +1,6 @@
-use std::net::TcpListener;
+use std::{io::Write, net::TcpListener};
 use std::io::Read;
-use kv_store::{KvStore, Command};
+use kv_store::{Command, KvStore, Response};
 
 fn main() {
     let store = KvStore::new();
@@ -19,11 +19,17 @@ fn main() {
             Command::Set { key: k, value: v } => {
             println!("The client wants to store {} bytes under the key '{}'", v.len(), k);
             store.set(k, v);
-        }
+            let response = Response::Ok;
+            let response_bytes = bincode::serialize(&response).unwrap();
+            stream.write_all(&response_bytes).unwrap();
+            }
     
             Command::Get { key: k } => {
             println!("The client is asking for the key '{}'", k);
-            store.get(&k);
+            let value = store.get(&k);
+            let response = Response::Value((value));
+            let response_bytes = bincode::serialize(&response).unwrap();
+            stream.write_all(&response_bytes).unwrap();
             }
         }
     }
