@@ -15,22 +15,21 @@ fn main() {
         stream.read_to_end(&mut buffer).unwrap();
         let cmd: Command = bincode::deserialize(&buffer).unwrap();
 
-        match cmd {
+        let response = match cmd {
             Command::Set { key: k, value: v } => {
             println!("The client wants to store {} bytes under the key '{}'", v.len(), k);
             store.set(k, v);
-            let response = Response::Ok;
-            let response_bytes = bincode::serialize(&response).unwrap();
-            stream.write_all(&response_bytes).unwrap();
+            Response::Ok
             }
     
             Command::Get { key: k } => {
             println!("The client is asking for the key '{}'", k);
             let value = store.get(&k);
-            let response = Response::Value((value));
-            let response_bytes = bincode::serialize(&response).unwrap();
-            stream.write_all(&response_bytes).unwrap();
+            Response::Value(value)
             }
-        }
+        };
+
+        let response_bytes = bincode::serialize(&response).unwrap();
+        stream.write_all(&response_bytes).unwrap();
     }
 }
