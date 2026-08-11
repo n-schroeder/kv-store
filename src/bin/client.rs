@@ -20,8 +20,13 @@ fn main() {
 
     stream.shutdown(Shutdown::Write).unwrap();
 
-    let mut buffer= Vec::new();
-    stream.read_to_end(&mut buffer).unwrap();
-    let server_response: Response = bincode::deserialize(&buffer).unwrap();
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).unwrap();
+
+    let len_payload = u32::from_be_bytes(len_buf) as usize;
+    let mut payload_buf = vec![0u8, len_payload as u8];
+    stream.read_exact(&mut payload_buf).unwrap();
+
+    let server_response: Response = bincode::deserialize(&payload_buf).unwrap();
     println!("Server response: {:?}", server_response);
 }
