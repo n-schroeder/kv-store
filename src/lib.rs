@@ -34,6 +34,13 @@ pub enum Command {
     Get { key: String },
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum Response {
+    Ok,
+    Value(Option<Vec<u8>>),
+    Error(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
