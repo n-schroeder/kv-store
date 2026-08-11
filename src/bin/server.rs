@@ -29,7 +29,10 @@ fn main() {
             }
         };
 
-        let response_bytes = bincode::serialize(&response).unwrap();
-        stream.write_all(&response_bytes).unwrap();
+    let payload = bincode::serialize(&response).unwrap();
+    let len_bytes = (payload.len() as u32).to_be_bytes();
+
+    stream.write_all(&len_bytes).unwrap();
+    stream.write_all(&payload).unwrap();
     }
 }
