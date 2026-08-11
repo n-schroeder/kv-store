@@ -11,9 +11,14 @@ fn main() {
         let mut stream = stream_result.unwrap();
         println!("Client connected.");
 
-        let mut buffer = Vec::new();
-        stream.read_to_end(&mut buffer).unwrap();
-        let cmd: Command = bincode::deserialize(&buffer).unwrap();
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+
+        let len_payload = u32::from_be_bytes(len_buf) as usize;
+        let mut payload_buf = vec![0u8, len_payload as u8];
+        stream.read_exact(&mut payload_buf).unwrap();
+
+        let cmd: Command = bincode::deserialize(&payload_buf).unwrap();
 
         let response = match cmd {
             Command::Set { key: k, value: v } => {
