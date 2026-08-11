@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::net::{TcpStream, Shutdown};
 use std::io::{Read, Write};
 use std::println;
 use kv_store::{Command, Response};
@@ -14,6 +14,8 @@ fn main() {
 
     let bytes = bincode::serialize(&cmd).unwrap();
     stream.write_all(&bytes).unwrap();
+
+    stream.shutdown(Shutdown::Write).unwrap();
 
     let mut buffer= Vec::new();
     stream.read_to_end(&mut buffer).unwrap();
