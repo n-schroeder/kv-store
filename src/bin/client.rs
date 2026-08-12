@@ -1,4 +1,4 @@
-use std::net::{TcpStream, Shutdown};
+use std::net::{TcpStream};
 use std::io::{Read, Write};
 use std::println;
 use kv_store::{Command, Response};
@@ -18,15 +18,13 @@ fn main() {
     stream.write_all(&len_bytes).unwrap();
     stream.write_all(&payload).unwrap();
 
-    stream.shutdown(Shutdown::Write).unwrap();
-
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).unwrap();
 
-    let len_payload = u32::from_be_bytes(len_buf) as usize;
-    let mut payload_buf = vec![0u8, len_payload as u8];
-    stream.read_exact(&mut payload_buf).unwrap();
+    let len_server_response = u32::from_be_bytes(len_buf) as usize;
+    let mut response_buf = vec![0u8; len_server_response];
+    stream.read_exact(&mut response_buf).unwrap();
 
-    let server_response: Response = bincode::deserialize(&payload_buf).unwrap();
+    let server_response: Response = bincode::deserialize(&response_buf).unwrap();
     println!("Server response: {:?}", server_response);
 }
