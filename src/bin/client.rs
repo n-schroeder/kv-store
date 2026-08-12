@@ -12,19 +12,21 @@ fn main() {
         value: vec![1, 2, 3, 4],
     };
 
-    let payload = bincode::serialize(&cmd).unwrap();
-    let len_bytes = (payload.len() as u32).to_be_bytes();
+    for _i in 1..=5 {
+        let payload = bincode::serialize(&cmd).unwrap();
+        let len_bytes = (payload.len() as u32).to_be_bytes();
 
-    stream.write_all(&len_bytes).unwrap();
-    stream.write_all(&payload).unwrap();
+        stream.write_all(&len_bytes).unwrap();
+        stream.write_all(&payload).unwrap();
 
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).unwrap();
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
 
-    let len_server_response = u32::from_be_bytes(len_buf) as usize;
-    let mut response_buf = vec![0u8; len_server_response];
-    stream.read_exact(&mut response_buf).unwrap();
+        let len_server_response = u32::from_be_bytes(len_buf) as usize;
+        let mut response_buf = vec![0u8; len_server_response];
+        stream.read_exact(&mut response_buf).unwrap();
 
-    let server_response: Response = bincode::deserialize(&response_buf).unwrap();
-    println!("Server response: {:?}", server_response);
+        let server_response: Response = bincode::deserialize(&response_buf).unwrap();
+        println!("Server response: {:?}", server_response);
+    }
 }
