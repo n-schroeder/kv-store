@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1.7878").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:7878").await.unwrap();
     println!("Async server listening on port 7878");
 
     let store = KvStore::new();
