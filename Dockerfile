@@ -1,6 +1,6 @@
 # Stage 1: Build
 
-FROM rust:1.97-bookwrom AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /usr/src/kv_store
 
