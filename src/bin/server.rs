@@ -5,9 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878").await.unwrap();
-    println!("Async server listening on port 7878");
+    println!("Async Server with WAL listening on port 7878");
 
-    let store = KvStore::new();
+    let store = KvStore::open().await;
 
     loop {
         let (mut stream, addr) = listener.accept().await.unwrap();
@@ -30,7 +30,7 @@ async fn main() {
                         let response = match cmd {
                             Command::Set { key: k, value: v } => {
                             println!("The client wants to store {} bytes under the key '{}'", v.len(), k);
-                            store_clone.set(k, v);
+                            store_clone.set(k, v).await;
                             Response::Ok
                             }
                     
