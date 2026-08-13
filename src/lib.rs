@@ -58,9 +58,22 @@ impl KvStore {
         }
     }
 
-    pub fn set(&self, key: String, value: Vec<u8>) {
-        let mut lock = self.db.write().unwrap();
-        lock.insert(key, value);
+    pub async fn set(&self, key: String, value: Vec<u8>) {
+        let mut cmd = Command::Set { key: key.clone(), value: value.clone()};
+
+        let payload = bincode::serialize(&cmd).unwrap();
+        let len_bytes = (payload.len() as u32).to_be_bytes();
+
+        let mut wal = self.wal.lock().await;
+        wal.write_all(&len_bytes).await.unwrap();
+        wal.write_all(&payload).await.unwrap();
+
+        wal.flush().await.unwrap();
+
+        drop(wal);
+
+        let mut store = self.db.write().unwrap();
+        store.insert(key, value);
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
