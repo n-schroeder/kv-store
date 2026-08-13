@@ -18,4 +18,4 @@ COPY --from=builder /usr/src/kv-store/targe/release/server /usr/local/bin/
 
 EXPOSE 7878
 
-RUN ["server"]
+CMD ["server"]
