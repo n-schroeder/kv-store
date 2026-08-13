@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 use tokio::fs::{OpenOptions, File};
@@ -8,15 +9,53 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct KvStore {
     db: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    wal: Arc<Mutex<File>>,
 }
 
 impl KvStore {
-    pub fn new() -> Self {
-        let empty_map = HashMap::new();
-        let locked_map = RwLock::new(empty_map);
-        let thread_safe_db = Arc::new(locked_map);
+    pub async fn open() -> Self {
+        let mut store = HashMap::new();
 
-        KvStore { db: thread_safe_db }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open("wal.log")
+            .await
+            .unwrap();
+
+        loop {
+            let mut len_buf = [0u8; 4];
+
+            match file.read_exact(&mut len_buf).await {
+                Ok(_) => {
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut payload = vec![0u8; len];
+                    file.read_exact(&mut payload).await.unwrap();
+                    
+                    let cmd: Command = bincode::deserialize(&payload).unwrap();
+                    
+                    if let Command::Set { key, value } = cmd {
+                        store.insert(key, value);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        println!("Database booted. Restored {} keys from WAL.", store.len());
+
+        let append_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("wal.log")
+            .await
+            .unwrap();
+
+        KvStore {
+            db: Arc::new(RwLock::new(store)),
+            wal: Arc::new(Mutex::new(append_file)),
+        }
     }
 
     pub fn set(&self, key: String, value: Vec<u8>) {
