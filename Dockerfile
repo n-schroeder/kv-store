@@ -14,7 +14,7 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-COPY --from=builder /usr/src/kv-store/targe/release/server /usr/local/bin/
+COPY --from=builder /usr/src/kv-store/target/release/server /usr/local/bin/
 
 EXPOSE 7878
 
