@@ -2,7 +2,7 @@
 
 FROM rust:1.97-bookworm AS builder
 
-WORKDIR /usr/src/kv_store
+WORKDIR /usr/src/kv-store
 
 COPY . .
 
