@@ -1,6 +1,7 @@
 use kv_store::{Command, Response, KvStore};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{sleep, Duration};
 use std::env;
 
 #[tokio::main]
@@ -21,6 +22,31 @@ async fn main() {
     println!("Server Booted.");
     println!("Role: {}", if is_leader { "LEADER" } else { "FOLLOWER" });
     println!("Peers: {:?}", peers);
+
+    if is_leader {
+        let heartbeat_peers = peers.clone();
+    
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(150)).await;
+                
+                for peer in &heartbeat_peers {
+                    let peer_addr = peer.clone();
+                    
+                    tokio::spawn(async move {
+                        if let Ok(mut stream) = TcpStream::connect(&peer_addr).await {
+                            let hb = Command::Heartbeat;
+                            let payload = bincode::serialize(&hb).unwrap();
+                            let len_bytes = (payload.len() as u32).to_be_bytes();
+                            
+                            let _ = stream.write_all(&len_bytes).await;
+                            let _ = stream.write_all(&payload).await;
+                        }
+                    });
+                }
+            }
+        });
+    }
 
     loop {
         let (mut stream, addr) = listener.accept().await.unwrap();
@@ -76,6 +102,10 @@ async fn main() {
                                     Some(val) => Response::Value(Some(val)),
                                     None => Response::Error("Key not found".to_string()),
                                 }
+                            }
+
+                            Command::Heartbeat => {
+                                Response::Ok
                             }
                         };
 
