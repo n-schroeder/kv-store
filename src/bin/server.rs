@@ -43,6 +43,7 @@ async fn main() {
                         
                         let response = match cmd {
                             Command::Set { key: k, value: v } => {
+                                println!("The client wants to store {} bytes under the key '{}'", v.len(), k);
                                 store_clone.set(k.clone(), v.clone()).await;
 
                                 if is_leader {
