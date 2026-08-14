@@ -86,6 +86,7 @@ impl KvStore {
 pub enum Command {
     Set { key: String, value: Vec<u8> },
     Get { key: String },
+    Heartbeat,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
