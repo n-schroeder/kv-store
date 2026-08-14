@@ -10,7 +10,7 @@ async fn main() {
 
     for i in 0..100 {
         let task = tokio::spawn(async move {
-            let mut stream = TcpStream::connect("127.0.0.1:7878").await.unwrap();
+            let mut stream = TcpStream::connect("192.168.1.120:7878").await.unwrap();
             
             let cmd = Command::Set {
                 key: format!("key_{}", i),
