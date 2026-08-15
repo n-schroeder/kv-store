@@ -1,1 +1,10 @@
-/target
+/target/
+
+*.tar
+
+wal.log
+*.log
+/laptop-kv-data/
+/kv-store-data/
+
+.DS_Store
