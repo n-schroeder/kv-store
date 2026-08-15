@@ -11,7 +11,7 @@ sudo docker run -d \
   -p 7878:7878 \
   -v ~/dev/data/kv-store:/app:Z \
   -e IS_LEADER=true \
-  -e PEERS="192.168.1.50:7878" \
+  -e PEERS="192.168.1.120:7878" \
   --name laptop-leader \
   kv-server
 
