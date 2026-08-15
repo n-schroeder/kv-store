@@ -105,6 +105,7 @@ async fn main() {
                             }
 
                             Command::Heartbeat => {
+                                println!("Received heartbeat");
                                 Response::Ok
                             }
                         };
