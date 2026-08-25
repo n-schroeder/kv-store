@@ -6,10 +6,15 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[derive(PartialEq)]
+enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 #[tokio::main]
 async fn main() {
-    let is_leader = env::var("IS_LEADER").unwrap_or_else(|_| "false".to_string()) == "true";
-
     let peers_env = env::var("PEERS").unwrap_or_default();
     let peers: Vec<String> = peers_env
         .split(',')
@@ -22,27 +27,33 @@ async fn main() {
     let store = KvStore::open().await;
 
     println!("Server Booted.");
-    println!("Role: {}", if is_leader { "LEADER" } else { "FOLLOWER" });
+    println!("Role: FOLLOWER");
     println!("Peers: {:?}", peers);
 
+    let role = Arc::new(Mutex::new(Role::Follower));
     let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
 
-    if is_leader {
+    {
         let heartbeat_peers = peers.clone();
-    
+        let role_for_sender = role.clone();
+
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_millis(150)).await;
-                
+
+                if *role_for_sender.lock().unwrap() != Role::Leader {
+                    continue;
+                }
+
                 for peer in &heartbeat_peers {
                     let peer_addr = peer.clone();
-                    
+
                     tokio::spawn(async move {
                         if let Ok(mut stream) = TcpStream::connect(&peer_addr).await {
                             let hb = Command::Heartbeat;
                             let payload = bincode::serialize(&hb).unwrap();
                             let len_bytes = (payload.len() as u32).to_be_bytes();
-                            
+
                             let _ = stream.write_all(&len_bytes).await;
                             let _ = stream.write_all(&payload).await;
                         }
@@ -52,17 +63,26 @@ async fn main() {
         });
     }
 
-    if !is_leader {
+    {
         let follower_timer = last_heartbeat.clone();
+        let role_for_watchdog = role.clone();
 
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_millis(100)).await;
 
+                if *role_for_watchdog.lock().unwrap() != Role::Follower {
+                    continue;
+                }
+
                 let elapsed = follower_timer.lock().unwrap().elapsed();
 
                 if elapsed > Duration::from_millis(500) {
-                    println!("WARNING: No heartbeat received in {}ms. Leader may be down.", elapsed.as_millis());
+                    *role_for_watchdog.lock().unwrap() = Role::Candidate;
+                    println!(
+                        "Timeout: no heartbeat in {}ms. Becoming CANDIDATE (election not yet implemented).",
+                        elapsed.as_millis()
+                    );
                 }
             }
         });
@@ -75,6 +95,7 @@ async fn main() {
         let store_clone = store.clone();
         let peers_clone = peers.clone();
         let last_heartbeat_clone = last_heartbeat.clone();
+        let role_clone = role.clone();
 
         tokio::spawn(async move {
             loop {
@@ -93,7 +114,7 @@ async fn main() {
                                 println!("The client wants to store {} bytes under the key '{}'", v.len(), k);
                                 store_clone.set(k.clone(), v.clone()).await;
 
-                                if is_leader {
+                                if *role_clone.lock().unwrap() == Role::Leader {
                                     for peer in &peers_clone {
                                         let peer_addr = peer.clone();
                                         let cmd_clone = Command::Set { 
