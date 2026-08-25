@@ -13,6 +13,31 @@ enum Role {
     Leader,
 }
 
+async fn request_vote(peer_addr: String, term: u64) -> Option<Response> {
+    let mut stream = match TcpStream::connect(&peer_addr).await {
+        Ok(s) => s,
+        Err(_) => {
+            println!("Election: peer {} unreachable, no vote counted.", peer_addr);
+            return None;
+        }
+    };
+
+    let cmd = Command::RequestVote { term };
+    let payload = bincode::serialize(&cmd).ok()?;
+    let len_bytes = (payload.len() as u32).to_be_bytes();
+
+    stream.write_all(&len_bytes).await.ok()?;
+    stream.write_all(&payload).await.ok()?;
+
+    let mut resp_len_buf = [0u8; 4];
+    stream.read_exact(&mut resp_len_buf).await.ok()?;
+    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+    let mut resp_payload = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_payload).await.ok()?;
+
+    bincode::deserialize(&resp_payload).ok()
+}
+
 #[tokio::main]
 async fn main() {
     let peers_env = env::var("PEERS").unwrap_or_default();
@@ -32,6 +57,7 @@ async fn main() {
 
     let role = Arc::new(Mutex::new(Role::Follower));
     let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
+    let term = Arc::new(Mutex::new(0u64));
 
     {
         let heartbeat_peers = peers.clone();
@@ -56,6 +82,13 @@ async fn main() {
 
                             let _ = stream.write_all(&len_bytes).await;
                             let _ = stream.write_all(&payload).await;
+
+                            let mut resp_len_buf = [0u8; 4];
+                            if stream.read_exact(&mut resp_len_buf).await.is_ok() {
+                                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+                                let mut resp_payload = vec![0u8; resp_len];
+                                let _ = stream.read_exact(&mut resp_payload).await;
+                            }
                         }
                     });
                 }
@@ -66,6 +99,8 @@ async fn main() {
     {
         let follower_timer = last_heartbeat.clone();
         let role_for_watchdog = role.clone();
+        let term_for_election = term.clone();
+        let election_peers = peers.clone();
 
         tokio::spawn(async move {
             loop {
@@ -83,6 +118,46 @@ async fn main() {
                         "Timeout: no heartbeat in {}ms. Becoming CANDIDATE (election not yet implemented).",
                         elapsed.as_millis()
                     );
+
+                    let term_for_election = term_for_election.clone();
+                    let role_for_election = role_for_watchdog.clone();
+                    let election_peers = election_peers.clone();
+
+                    tokio::spawn(async move {
+                        let current_term = {
+                            let mut t = term_for_election.lock().unwrap();
+                            *t += 1;
+                            *t
+                        };
+
+                        println!("Starting election for term {}.", current_term);
+
+                        let needed = (1 + election_peers.len()) / 2 + 1;
+                        let mut votes = 1; // self-vote
+
+                        let mut set = tokio::task::JoinSet::new();
+                        for peer in election_peers {
+                            set.spawn(async move { request_vote(peer, current_term).await });
+                        }
+
+                        while let Some(result) = set.join_next().await {
+                            if let Ok(Some(Response::VoteResponse { vote_granted: true, .. })) = result {
+                                votes += 1;
+                            }
+                        }
+
+                        println!(
+                            "Election for term {}: received {} of {} votes needed.",
+                            current_term, votes, needed
+                        );
+
+                        if votes >= needed {
+                            *role_for_election.lock().unwrap() = Role::Leader;
+                            println!("Won election for term {} with {} votes. Becoming LEADER.", current_term, votes);
+                        } else {
+                            println!("Election for term {} failed to reach majority. Remaining CANDIDATE (no retry).", current_term);
+                        }
+                    });
                 }
             }
         });
@@ -96,6 +171,7 @@ async fn main() {
         let peers_clone = peers.clone();
         let last_heartbeat_clone = last_heartbeat.clone();
         let role_clone = role.clone();
+        let term_clone = term.clone();
 
         tokio::spawn(async move {
             loop {
@@ -126,9 +202,16 @@ async fn main() {
                                             if let Ok(mut peer_stream) = TcpStream::connect(&peer_addr).await {
                                                 let payload = bincode::serialize(&cmd_clone).unwrap();
                                                 let len_bytes = (payload.len() as u32).to_be_bytes();
-                                                
+
                                                 let _ = peer_stream.write_all(&len_bytes).await;
                                                 let _ = peer_stream.write_all(&payload).await;
+
+                                                let mut resp_len_buf = [0u8; 4];
+                                                if peer_stream.read_exact(&mut resp_len_buf).await.is_ok() {
+                                                    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+                                                    let mut resp_payload = vec![0u8; resp_len];
+                                                    let _ = peer_stream.read_exact(&mut resp_payload).await;
+                                                }
                                             } else {
                                                 println!("Replication failed: Node {} is unreachable.", peer_addr);
                                             }
@@ -150,6 +233,32 @@ async fn main() {
                                 *last_heartbeat_clone.lock().unwrap() = Instant::now();
                                 println!("Received heartbeat");
                                 Response::Ok
+                            }
+
+                            Command::RequestVote { term: incoming_term } => {
+                                let mut local_term = term_clone.lock().unwrap();
+                                let vote_granted = incoming_term > *local_term;
+
+                                if vote_granted {
+                                    *local_term = incoming_term;
+                                }
+                                let current_term = *local_term;
+                                drop(local_term);
+
+                                if vote_granted {
+                                    let mut current_role = role_clone.lock().unwrap();
+                                    if *current_role != Role::Follower {
+                                        println!("Stepping down to FOLLOWER: saw higher term {} in RequestVote.", incoming_term);
+                                        *current_role = Role::Follower;
+                                    }
+                                    drop(current_role);
+                                    *last_heartbeat_clone.lock().unwrap() = Instant::now();
+                                    println!("Granted vote for term {}.", incoming_term);
+                                } else {
+                                    println!("Rejected vote request for term {} (local term is {}).", incoming_term, current_term);
+                                }
+
+                                Response::VoteResponse { term: current_term, vote_granted }
                             }
                         };
 
