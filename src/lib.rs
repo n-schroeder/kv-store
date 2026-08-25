@@ -87,6 +87,7 @@ pub enum Command {
     Set { key: String, value: Vec<u8> },
     Get { key: String },
     Heartbeat,
+    RequestVote { term: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -94,6 +95,7 @@ pub enum Response {
     Ok,
     Value(Option<Vec<u8>>),
     Error(String),
+    VoteResponse { term: u64, vote_granted: bool },
 }
 
 #[cfg(test)]
