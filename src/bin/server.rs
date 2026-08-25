@@ -1,7 +1,7 @@
 use kv_store::{Command, Response, KvStore};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,9 +14,9 @@ enum Role {
 }
 
 async fn request_vote(peer_addr: String, term: u64) -> Option<Response> {
-    let mut stream = match TcpStream::connect(&peer_addr).await {
-        Ok(s) => s,
-        Err(_) => {
+    let mut stream = match timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
+        Ok(Ok(s)) => s,
+        _ => {
             println!("Election: peer {} unreachable, no vote counted.", peer_addr);
             return None;
         }
@@ -75,7 +75,7 @@ async fn main() {
                     let peer_addr = peer.clone();
 
                     tokio::spawn(async move {
-                        if let Ok(mut stream) = TcpStream::connect(&peer_addr).await {
+                        if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
                             let hb = Command::Heartbeat;
                             let payload = bincode::serialize(&hb).unwrap();
                             let len_bytes = (payload.len() as u32).to_be_bytes();
@@ -203,7 +203,7 @@ async fn main() {
                                         };
                                         
                                         tokio::spawn(async move {
-                                            if let Ok(mut peer_stream) = TcpStream::connect(&peer_addr).await {
+                                            if let Ok(Ok(mut peer_stream)) = timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
                                                 let payload = bincode::serialize(&cmd_clone).unwrap();
                                                 let len_bytes = (payload.len() as u32).to_be_bytes();
 
