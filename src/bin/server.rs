@@ -152,8 +152,12 @@ async fn main() {
                         );
 
                         if votes >= needed {
-                            *role_for_election.lock().unwrap() = Role::Leader;
-                            println!("Won election for term {} with {} votes. Becoming LEADER.", current_term, votes);
+                            if *term_for_election.lock().unwrap() == current_term {
+                                *role_for_election.lock().unwrap() = Role::Leader;
+                                println!("Won election for term {} with {} votes. Becoming LEADER.", current_term, votes);
+                            } else {
+                                println!("Election for term {} won but term has since advanced; discarding stale result.", current_term);
+                            }
                         } else {
                             println!("Election for term {} failed to reach majority. Remaining CANDIDATE (no retry).", current_term);
                         }
