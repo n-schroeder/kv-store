@@ -3,6 +3,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, Duration};
 use std::env;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
@@ -22,6 +24,8 @@ async fn main() {
     println!("Server Booted.");
     println!("Role: {}", if is_leader { "LEADER" } else { "FOLLOWER" });
     println!("Peers: {:?}", peers);
+
+    let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
 
     if is_leader {
         let heartbeat_peers = peers.clone();
@@ -48,12 +52,29 @@ async fn main() {
         });
     }
 
+    if !is_leader {
+        let follower_timer = last_heartbeat.clone();
+
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(100)).await;
+
+                let elapsed = follower_timer.lock().unwrap().elapsed();
+
+                if elapsed > Duration::from_millis(500) {
+                    println!("WARNING: No heartbeat received in {}ms. Leader may be down.", elapsed.as_millis());
+                }
+            }
+        });
+    }
+
     loop {
         let (mut stream, addr) = listener.accept().await.unwrap();
         println!("New client connected: {}", addr);
 
         let store_clone = store.clone();
         let peers_clone = peers.clone();
+        let last_heartbeat_clone = last_heartbeat.clone();
 
         tokio::spawn(async move {
             loop {
@@ -105,6 +126,7 @@ async fn main() {
                             }
 
                             Command::Heartbeat => {
+                                *last_heartbeat_clone.lock().unwrap() = Instant::now();
                                 println!("Received heartbeat");
                                 Response::Ok
                             }
