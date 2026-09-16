@@ -1,163 +1,269 @@
 # kv-store
 
-A small async key-value store in Rust (tokio), with a write-ahead log for
-durability and a Raft-lite leader-election layerr. Built
-as a learning project for distributed-systems fundamentals.
+A small async key-value store written in Rust on top of tokio. Writes go
+through a write-ahead log (WAL) so data survives restarts, and the nodes in a
+cluster elect a leader using a stripped-down version of Raft's election
+protocol. I'm building it as a learning project for distributed-systems
+fundamentals, so the code favors being easy to read over being feature-complete.
 
 ## Quick start
 
 ```bash
 cargo build --release --bin server   # build the server binary (what the Dockerfile builds)
-cargo run --bin server               # run the server locally (listens on 0.0.0.0:7878, writes ./wal.log)
-cargo run --bin client               # load-test client (100 concurrent SETs + 1 GET against localhost:7878)
-cargo test                           # run tests (currently just src/lib.rs's test_serialization)
+cargo run --bin server               # run a node locally (listens on 0.0.0.0:7878, writes ./wal.log)
+cargo run --bin client               # load test: 100 concurrent SETs, then 1 GET, against localhost:7878
+cargo test                           # run the tests (currently just test_serialization in src/lib.rs)
 ```
 
-There's no lint config (no clippy/rustfmt CI step) and no `tests/`
-integration directory — all tests live inline in `src/lib.rs` under
-`#[cfg(test)]`.
+A node finds the rest of the cluster through the `PEERS` environment variable,
+a comma-separated list of `host:port` addresses that doesn't include the node
+itself:
+
+```bash
+PEERS=node2:7878,node3:7878 cargo run --bin server
+```
+
+The port (`7878`) and WAL path (`wal.log`) are hardcoded, so you can only run
+one node per machine. To run a multi-node cluster on one machine, put each
+node in its own Docker container.
+
+There's no lint config and no `tests/` directory. All tests live inline in
+`src/lib.rs` under `#[cfg(test)]`.
+
+## Project layout
+
+| File | What it does |
+|---|---|
+| `src/lib.rs` | `KvStore` (in-memory map + WAL) and the `Command` / `Response` message types |
+| `src/bin/server.rs` | Networking, leader election, heartbeats, and replication |
+| `src/bin/client.rs` | A load-testing tool, not a client library |
+
+## Messages and framing
+
+Everything a node sends or stores is one of two enums:
+
+- `Command`: `Set { key, value }`, `Get { key }`, `Heartbeat { term }`,
+  `RequestVote { term }`
+- `Response`: `Ok`, `Value(Option<Vec<u8>>)`, `Error(String)`,
+  `VoteResponse { term, vote_granted }`, `HeartbeatAck { term }`
+
+Each message is serialized with bincode and framed the same way everywhere:
+a 4-byte big-endian `u32` length prefix, then the payload. That goes for
+client traffic, node-to-node traffic, and the records in `wal.log`.
+
+Sharing one encoding keeps the serialization code in one place, but it couples
+things together. If you change either enum, the network code in `server.rs` and
+`client.rs` and the WAL code in `lib.rs` have to change with it. Existing
+`wal.log` files stop being readable, and every node in a cluster has to run
+the same build, since old and new binaries can't decode each other's messages.
+
+## Storage: `KvStore`
+
+`KvStore` keeps the data in a `HashMap<String, Vec<u8>>` behind an
+`Arc<RwLock<_>>`, with the WAL file behind an `Arc<Mutex<_>>`.
+
+- **Startup (`KvStore::open`)** reads `wal.log` from the start and replays every
+  `Set` record into the map, so the last write to a key wins. It then reopens
+  the file in append mode. Replay ignores every other record type. Nothing ever
+  compacts the log, so it grows forever and gets fully replayed on every boot.
+- **Writes (`KvStore::set`)** append the record to the WAL and call `flush()`,
+  and only then update the map. The WAL lock is released before the map lock
+  is taken, so the two are never held at the same time. `flush()` isn't an
+  `fsync`, though, so a write can still be lost if the machine loses power
+  right after it.
+- **Reads (`KvStore::get`)** only look at the in-memory map.
+
+Most I/O calls `.unwrap()`, so a disk error crashes the task instead of being
+handled. That includes WAL replay at startup.
+
+## Leader election
+
+Every node starts as a `Follower`. There's no configured leader. The cluster
+picks one on its own and picks a new one when the current leader goes away.
+
+Each node tracks three pieces of in-memory state:
+
+- **`role`**: `Follower`, `Candidate`, or `Leader`
+- **`term`**: a number that goes up by one with every election. Terms let nodes
+  tell current information from stale information.
+- **`last_heartbeat`**: when this node last heard from a legitimate leader
+
+None of these are saved to disk, so a restarted node comes back as a
+`Follower` in term 0. All three use `std::sync::Mutex`, because each access is a
+quick read or write that's never held across an `.await`.
+
+### Heartbeats
+
+Every 150ms, the leader sends `Heartbeat { term }` to each peer. When a node
+gets a heartbeat:
+
+- **The heartbeat's term is newer than its own.** The node adopts that term,
+  steps down to `Follower` if it wasn't one already, and resets its heartbeat
+  timer.
+- **The heartbeat's term matches its own.** The heartbeat is from the current
+  leader, so the node resets its heartbeat timer. If the node was a `Candidate`
+  in this term, someone else already won, so it steps down to `Follower`.
+- **The heartbeat's term is older than its own.** The heartbeat comes from a
+  leader that has already been replaced. The node ignores it and doesn't reset
+  its timer, so a stale leader can't keep the rest of the cluster from holding
+  an election.
+
+Either way, the node replies with `HeartbeatAck { term }` carrying its own
+term. If that term is higher than the leader's, the leader learns it's been
+replaced and steps down. This is how a leader that was cut off from the
+cluster, or just fell behind, finds out an election happened without it.
+
+The leader always waits for the ack before closing the connection. Closing
+without reading the reply used to race the peer's response and crash the
+peer's connection task with `BrokenPipe`.
+
+### Starting an election
+
+A watchdog on each node checks every 100ms. If the node is a `Follower` and
+hasn't heard a heartbeat within its **election timeout**, it becomes a
+`Candidate` and starts an election:
+
+1. Increment `term` and vote for itself.
+2. Send `RequestVote { term }` to every peer at the same time.
+3. Count the votes. A majority of the whole cluster wins, counting the node
+   itself: 2 of 3 nodes, 3 of 5.
+4. If it has a majority *and* its term hasn't changed since the election
+   started, become `Leader` and start sending heartbeats.
+
+The term check in step 4 prevents a real bug. While votes are still coming
+in, the node may already have moved to a newer term. If a late win were still
+applied, it would overwrite that newer state. Before the check was added, a
+3-node test cluster briefly had two leaders at once.
+
+### Voting
+
+A node grants a vote only if the candidate's term is **strictly higher** than
+its own. Granting the vote also bumps its term to match, so a second candidate
+in the same term gets turned down. That's what limits each node to one vote
+per term, with no separate "voted" flag. A node that grants a vote also steps
+down to `Follower` if it wasn't one, and resets its heartbeat timer.
+
+### When an election fails
+
+If a candidate doesn't get a majority, because too many nodes are down or the
+vote split, it goes back to being a `Follower` and resets its heartbeat timer.
+Once its election timeout runs out again, the watchdog starts a new election
+in the next term. The node keeps retrying until one succeeds or a leader shows
+up.
+
+The election timeout is picked at random between **500ms and 1000ms**, and a
+new value is picked every time it fires. Without the randomness, nodes that
+lost their leader at the same moment would all time out together, split the
+vote, and repeat that forever. With it, one node usually times out first and
+wins before the others try.
+
+### Stepping down
+
+The rule "if you see a higher term, adopt it and become a `Follower`" lives in
+a single helper, `adopt_term_if_newer`, which runs in three places:
+
+- when a node receives a `RequestVote`
+- when a node receives a `Heartbeat`
+- when the leader reads back a `HeartbeatAck`
+
+### Timeouts at a glance
+
+| Setting | Value | Why |
+|---|---|---|
+| Heartbeat interval | 150ms | Comfortably shorter than the smallest election timeout |
+| Watchdog check interval | 100ms | How often a follower checks whether its leader has gone quiet |
+| Election timeout | random 500–1000ms | Randomized so candidates don't keep splitting the vote |
+| Peer connect timeout | 150ms | Makes an unreachable peer fail fast |
+| `RequestVote` round trip | 150ms total | Covers connect, send, and reply, so one slow peer can't stall an election |
+
+The connect timeout exists for a reason. Without it, connecting to a dead peer
+could hang longer than the election timeout. In a 3-node test with one node
+killed, the two survivors kept starting overlapping elections and churned
+through 10 terms in about 5 seconds without ever settling on a leader.
+
+### What it looks like
+
+Here's the start of a 5-node cluster, with heartbeat lines filtered out:
+
+```
+node1  | Granted vote for term 1.
+node5  | Granted vote for term 1.
+node4  | Granted vote for term 1.
+node2  | Granted vote for term 1.
+node3  | Starting election for term 1.
+node3  | Election for term 1: received 5 of 3 votes needed.
+node3  | Won election for term 1 with 5 votes. Becoming LEADER.
+```
+
+And here's a node that can't reach any of its peers, retrying with a new
+timeout each round:
+
+```
+Timeout: no heartbeat in 1015ms. Becoming CANDIDATE.
+Starting election for term 1.
+Election for term 1: received 1 of 2 votes needed.
+Election for term 1 failed to reach majority. Reverting to FOLLOWER to retry after next timeout.
+Timeout: no heartbeat in 761ms. Becoming CANDIDATE.
+Starting election for term 2.
+...
+```
+
+## Replication
+
+When the leader handles a `Set`, it writes the value locally and then sends
+the same `Set` to every peer, each over its own connection in a background
+task. It replies `Ok` to the client right away, without waiting for any peer.
+If a peer can't be reached, the failure is logged and never retried.
+
+This is best-effort replication, not Raft's log replication. See the
+limitations below for what that means in practice.
+
+## Client
+
+`client.rs` connects to `0.0.0.0:7878`, sends 100 concurrent `Set`s followed by
+one `Get`, and prints the responses. It's for putting load on a server, not
+for building on as a client library.
 
 ## Deployment
 
-Deployment is manual, not CI-driven:
+Deployment is manual:
 
-- `./deploy_local.sh` — rebuilds the Docker image and runs it locally
-  (`laptop-leader`, `PEERS=192.168.1.120:7878`).
-- `./deploy_pi.sh` — cross-compiles for `linux/arm64` via `docker buildx`,
-  ships the tarball to a Raspberry Pi host (`node0` in SSH config) over
-  `scp`, and restarts the `rpi-server` container there as a follower.
+- **`./deploy_local.sh`** rebuilds the Docker image and runs it on this machine
+  as `laptop-leader` with `PEERS=192.168.1.120:7878`. Despite the name, the
+  container starts as a follower like every other node. The script also still
+  sets `IS_LEADER=true`, which the server no longer reads.
+- **`./deploy_pi.sh`** cross-compiles for `linux/arm64` with `docker buildx`,
+  copies the image to a Raspberry Pi (`node0` in SSH config) over `scp`, and
+  restarts the `rpi-server` container there.
 
-Both deployments bind-mount a host directory to `/app` (the container's
-`WORKDIR`), which is what makes `wal.log` persist across container
-restarts/redeploys. The WAL path itself is a hardcoded relative literal
-(`"wal.log"`), not configurable via env var or flag.
-
-## Architecture
-
-The codebase is a library (`src/lib.rs`) plus two binaries
-(`src/bin/server.rs`, `src/bin/client.rs`).
-
-### One wire format for everything
-
-`Command` (`Set { key, value }`, `Get { key }`, `Heartbeat`,
-`RequestVote { term }`) and `Response` (`Ok`, `Value(Option<Vec<u8>>)`,
-`Error(String)`, `VoteResponse { term, vote_granted }`) are bincode-serialized
-and framed identically wherever they show up: over the network
-(client-server, and leader-follower replication/heartbeats/elections) and
-on disk in `wal.log` — a 4-byte big-endian `u32` length prefix followed by
-the bincode payload.
-
-Reusing one encoding for both the wire protocol and the on-disk log keeps
-the serialization code in one place. The cost is coupling: changing either
-enum means keeping the network handling in `server.rs`/`client.rs` and the
-WAL read/write logic in `lib.rs` in sync, and it breaks compatibility with
-any existing `wal.log` file. `KvStore::open()`'s replay loop only ever acts
-on `Command::Set` (via `if let`), so the other variants — including
-`RequestVote`, which is never written to the WAL — are safely ignored
-during recovery.
-
-### `KvStore`: the storage engine (`src/lib.rs`)
-
-Holds an in-memory `HashMap<String, Vec<u8>>` behind `Arc<RwLock<_>>`, plus
-an `Arc<Mutex<tokio::fs::File>>` for the WAL.
-
-- **`KvStore::open()`** does recovery: reads `wal.log` sequentially,
-  replaying every `Command::Set` record into the map (last write for a key
-  wins), then reopens the file in append mode for subsequent writes. There
-  is no checkpointing or compaction — the file grows unboundedly, and a
-  full replay happens on every startup.
-- **`KvStore::set()`** writes the record to the WAL and calls `flush()`
-  (not `fsync`/`sync_all`) *before* mutating the in-memory map, then drops
-  the WAL lock before taking the map's write lock — so the two locks are
-  never held simultaneously. This ordering means a crash between the flush
-  and the map mutation can't lose an acknowledged write, but `flush()`
-  alone doesn't guarantee the data survived a power loss (only `fsync`
-  does) — a deliberate durability/throughput tradeoff.
-- **`KvStore::get()`** only touches the in-memory map; it never reads or
-  writes the WAL.
-- Nearly all I/O uses `.unwrap()`. I/O errors panic the task rather than
-  propagating — including in the recovery loop in `open()`. Simple, and
-  appropriate for a single-purpose service where a broken disk should be
-  loud, not swallowed.
-
-### `server.rs`: networking, replication, and Raft-lite (`src/bin/server.rs`)
-
-Every node boots as `Follower`; there's no `IS_LEADER` env var — the only
-thing read from the environment is `PEERS` (comma-separated `host:port`).
-Role, a `last_heartbeat: Arc<Mutex<Instant>>` timestamp, and a
-`term: Arc<Mutex<u64>>` counter are shared, process-local state — not
-persisted, not part of `KvStore` — all using `std::sync::Mutex` since every
-access is a synchronous compare-or-set that's never held across an
-`.await`.
-
-Three background mechanisms drive the `Role` state machine
-(`Follower` / `Candidate` / `Leader`), all running unconditionally on every
-node and gating their behavior on the current role:
-
-1. **Heartbeat sender** — ticks every 150ms; while `Role::Leader`, fires
-   `Command::Heartbeat` at every peer, reading back the `Response` before
-   dropping the connection. That read-back is required: a fire-and-forget
-   write races the peer's own reply and previously crashed the peer's
-   connection task with `BrokenPipe`.
-2. **Follower watchdog** — ticks every 100ms; while `Role::Follower`, if
-   `last_heartbeat.elapsed()` exceeds 500ms it flips to `Role::Candidate`
-   (logging once — the role-guard at the top of the loop means it won't
-   refire) and spawns an election task: increments `term`, self-votes,
-   fires `Command::RequestVote { term }` at every peer concurrently via a
-   `tokio::task::JoinSet`, and if it collects a strict majority of votes
-   (self included), sets `Role::Leader` — but *only if* `term` still
-   equals the term the election started with. That re-check matters: a
-   peer connect can stall well past when the election "should" have
-   resolved, and without it a late-arriving stale win would silently
-   clobber whatever the node had correctly moved on to in the meantime.
-   This was verified live — a 3-node cluster with one node killed briefly
-   ran two simultaneous leaders before the guard was added. If an election
-   doesn't reach majority (or its win turns out stale), the node just
-   stays `Candidate` forever — there's no retry/backoff loop.
-3. **Per-connection handler's `RequestVote` arm** — grants a vote only if
-   the incoming term is strictly higher than the locally known term. That
-   single `u64` comparison *is* the "already voted this term" check:
-   bumping the term and granting the vote happen in the same atomic
-   critical section, so no separate voted-flag is needed. Granting a vote
-   also steps a stale `Candidate`/`Leader` down to `Follower` and resets
-   `last_heartbeat` — this is the *only* way a stale `Leader` learns it's
-   behind, since `Heartbeat` carries no term. A `Leader` that's still
-   successfully heartbeating followers has no way to learn a newer term
-   won an election elsewhere unless that candidate's `RequestVote` reaches
-   it directly. **This is an accepted split-brain gap in the current
-   minimal wire format, not yet patched.**
-
-`Set` replication is push-based and best-effort: gated on
-`*role.lock().unwrap() == Role::Leader`, the leader fires an independent
-connection to each peer with the same command (reading back the response
-for the same `BrokenPipe`-avoidance reason as heartbeats). Replication
-failures/timeouts beyond a failed connect are only logged, never retried.
-
-**Every `TcpStream::connect` call** (`request_vote`, the heartbeat sender,
-and `Set`-replication forwarding) is wrapped in a 150ms
-`tokio::time::timeout`. Without this, a connect to a dead/unreachable peer
-stalls significantly longer than the 500ms follower timeout — verified
-live: with a 3-node cluster and one node killed, elections routinely took
-longer than 500ms to resolve because they were still waiting on the dead
-peer's connect, so the two live nodes kept leapfrogging each other into
-ever-higher terms (10 terms churned in ~5 seconds) instead of converging on
-a leader. The 150ms timeout makes an unreachable peer fail fast enough
-that elections reliably resolve within a single 500ms window.
-
-### `client.rs`: a load-testing tool, not a client library
-
-Hardcodes `0.0.0.0:7878`, fires 100 concurrent `Set`s then one `Get`, and
-prints the responses. Useful for exercising the server under concurrent
-load, not meant to be depended on as an SDK.
+Both scripts bind-mount a host directory to `/app`, the container's working
+directory, which is what keeps `wal.log` around across restarts and redeploys.
 
 ## Known limitations
 
-- No log compaction — `wal.log` grows forever, full replay on every
-  restart.
-- `flush()`-not-`fsync()` on writes trades a small durability window for
-  throughput.
-- Split-brain gap: a stale `Leader` that's still heartbeating successfully
-  has no way to learn a newer term won an election elsewhere, since
-  `Heartbeat` carries no term.
-- No election retry/backoff — a `Candidate` that fails to reach majority
-  stays `Candidate` forever rather than re-triggering a new round.
+Leader election is in reasonable shape. The data path isn't Raft yet, and
+most of the gaps below come from that.
+
+- **Terms aren't saved to disk.** A restarted node goes back to term 0, so it
+  can vote again in a term it already voted in before the crash. That can
+  produce two leaders in the same term.
+- **Writes are acknowledged before they're replicated.** If the leader dies
+  right after replying `Ok`, the write may exist only on the old leader.
+- **Log entries have no term or index.** Nodes can't compare logs, figure out
+  what's committed, or fix a log that has diverged.
+- **Votes don't check how complete the candidate's log is.** Raft only votes
+  for a candidate whose log is at least as up to date. This doesn't matter
+  yet, but it will once real replication exists.
+- **Nodes that fall behind never catch up.** A node that was down misses those
+  writes permanently.
+- **Replicated writes can arrive out of order.** Each `Set` goes out over its
+  own connection, so two quick writes to the same key can reach a follower in
+  the wrong order.
+- **Followers accept writes from clients** and apply them locally without
+  forwarding them to the leader.
+- **Reads can be stale,** because any node answers `Get` from its own data.
+- **A half-written WAL record crashes startup.** The replay loop unwraps every
+  read, so a record cut off by a crash stops the node from booting.
+- **`flush()` isn't `fsync`,** so a power loss can drop recent writes.
+- **The WAL is never compacted.** It grows forever and is fully replayed on
+  every boot.
