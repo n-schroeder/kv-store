@@ -6,6 +6,75 @@ cluster elect a leader using a stripped-down version of Raft's election
 protocol. I'm building it as a learning project for distributed-systems
 fundamentals, so the code favors being easy to read over being feature-complete.
 
+## See leader election in action
+
+The fastest way to see what this project does is the election demo. It starts
+a 5-node cluster in Docker, breaks it in seven different ways, and shows you
+what the nodes do about it:
+
+```bash
+./demo/election-demo.sh
+```
+
+All you need is Docker with the Compose plugin; Rust doesn't have to be
+installed. The script runs on macOS and Linux. On Windows, run it from WSL2
+(which Docker Desktop already uses) or Git Bash. The first run compiles the
+server inside Docker, which can take a few minutes. Later runs start almost
+immediately.
+
+The demo pauses before each scenario so you can read what's about to happen.
+For each one it:
+
+1. explains what's about to happen and what the cluster should do,
+2. makes it happen,
+3. prints the election-related log lines from all five nodes as one timeline,
+   with the constant heartbeat traffic filtered out, and
+4. checks that the cluster ended up in the right state, then prints PASS or
+   FAIL.
+
+| # | Scenario | What it shows |
+|---|---|---|
+| 1 | The cluster starts up | Five followers with no configured leader elect one on their own |
+| 2 | Kill the leader | A survivor times out and takes over in a higher term |
+| 3 | Bring the old leader back | It rejoins as a follower and adopts the current term |
+| 4 | Kill the leader and a follower | Three of five nodes is still a majority, so a new leader is elected |
+| 5 | Lose the majority | Two nodes can't win an election, so they keep retrying as the term climbs |
+| 6 | Restart the dead nodes | The cluster gets its majority back and settles on one leader |
+| 7 | Cut the leader off from the network, then reconnect it | The rest of the cluster moves on without it; once reconnected, it sees the newer term and steps down |
+
+Here's part of scenario 7 from a real run:
+
+```
+  18:40:58.079  node2  Timeout: no heartbeat in 614ms. Becoming CANDIDATE.
+  18:40:58.079  node2  Starting election for term 16.
+  18:40:58.080  node5  Granted vote for term 16.
+  18:40:58.080  node1  Granted vote for term 16.
+  18:40:58.080  node4  Granted vote for term 16.
+  18:40:58.231  node2  Election: peer node3:7878 unreachable or unresponsive within timeout, no vote counted.
+  18:40:58.231  node2  Election for term 16: received 4 of 3 votes needed.
+  18:40:58.231  node2  Won election for term 16 with 4 votes. Becoming LEADER.
+
+Right now node2 leads term 16, while node3 is cut off and still thinks it leads term 15.
+
+  18:40:59.840  node3  Stepping down to FOLLOWER: saw higher term 16.
+  18:40:59.840  node3  Received heartbeat for term 16.
+
+✓ PASS  node3 stepped down after reconnecting, and node2 is the only leader (term 16).
+```
+
+Options:
+
+- `--no-pause` runs every scenario back to back without waiting for Enter.
+- `--keep` leaves the cluster running afterward so you can poke at it.
+  Otherwise it's removed when the demo exits, including if you press Ctrl-C.
+
+The demo doesn't publish any ports on your machine. It leaves behind one
+Docker image, `kv-election-demo`, which you can remove with
+`docker image rm kv-election-demo`.
+
+Which node wins each election is random, so the node names and terms will be
+different on every run. That's expected.
+
 ## Quick start
 
 ```bash
@@ -25,7 +94,8 @@ PEERS=node2:7878,node3:7878 cargo run --bin server
 
 The port (`7878`) and WAL path (`wal.log`) are hardcoded, so you can only run
 one node per machine. To run a multi-node cluster on one machine, put each
-node in its own Docker container.
+node in its own Docker container. `demo/compose.yaml` does exactly that for
+five nodes.
 
 There's no lint config and no `tests/` directory. All tests live inline in
 `src/lib.rs` under `#[cfg(test)]`.
@@ -37,6 +107,8 @@ There's no lint config and no `tests/` directory. All tests live inline in
 | `src/lib.rs` | `KvStore` (in-memory map + WAL) and the `Command` / `Response` message types |
 | `src/bin/server.rs` | Networking, leader election, heartbeats, and replication |
 | `src/bin/client.rs` | A load-testing tool, not a client library |
+| `demo/election-demo.sh` | Runs the leader election demo described above |
+| `demo/compose.yaml` | The 5-node Docker Compose cluster the demo uses |
 
 ## Messages and framing
 
@@ -183,7 +255,9 @@ through 10 terms in about 5 seconds without ever settling on a leader.
 
 ### What it looks like
 
-Here's the start of a 5-node cluster, with heartbeat lines filtered out:
+To watch all of this on your own machine, run the
+[election demo](#see-leader-election-in-action). Here's the start of a 5-node
+cluster, with heartbeat lines filtered out:
 
 ```
 node1  | Granted vote for term 1.
@@ -247,6 +321,13 @@ most of the gaps below come from that.
 - **Terms aren't saved to disk.** A restarted node goes back to term 0, so it
   can vote again in a term it already voted in before the crash. That can
   produce two leaders in the same term.
+- **A node that steps down can immediately start an election of its own.**
+  When a leader or candidate learns about a higher term from a reply rather
+  than from the new leader's heartbeat, it becomes a follower without
+  resetting its election timer. If that timer has already run out, it starts
+  an election right away and can take leadership from a perfectly healthy
+  leader. Scenario 7 of the demo shows this in roughly half of runs: the
+  reconnected node steps down and then wins the next term.
 - **Writes are acknowledged before they're replicated.** If the leader dies
   right after replying `Ok`, the write may exist only on the old leader.
 - **Log entries have no term or index.** Nodes can't compare logs, figure out
