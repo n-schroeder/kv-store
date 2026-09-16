@@ -86,7 +86,7 @@ impl KvStore {
 pub enum Command {
     Set { key: String, value: Vec<u8> },
     Get { key: String },
-    Heartbeat,
+    Heartbeat { term: u64 },
     RequestVote { term: u64 },
 }
 
@@ -96,6 +96,7 @@ pub enum Response {
     Value(Option<Vec<u8>>),
     Error(String),
     VoteResponse { term: u64, vote_granted: bool },
+    HeartbeatAck { term: u64 },
 }
 
 #[cfg(test)]
