@@ -90,6 +90,7 @@ async fn main() {
         let heartbeat_peers = peers.clone();
         let role_for_sender = role.clone();
         let term_for_sender = term.clone();
+        let last_heartbeat_for_sender = last_heartbeat.clone();
 
         tokio::spawn(async move {
             loop {
@@ -105,6 +106,7 @@ async fn main() {
                     let peer_addr = peer.clone();
                     let role_for_hb = role_for_sender.clone();
                     let term_for_hb = term_for_sender.clone();
+                    let last_heartbeat_for_hb = last_heartbeat_for_sender.clone();
 
                     tokio::spawn(async move {
                         if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
@@ -122,8 +124,11 @@ async fn main() {
                                 if stream.read_exact(&mut resp_payload).await.is_ok() {
                                     if let Ok(Response::HeartbeatAck { term: ack_term }) = bincode::deserialize::<Response>(&resp_payload) {
                                         // A follower that has seen a newer term means someone else
-                                        // won an election we don't know about yet; step down.
-                                        adopt_term_if_newer(&term_for_hb, &role_for_hb, ack_term);
+                                        // won an election we don't know about yet; step down. Reset the
+                                        // election timer too, or it fires at once and disrupts the new leader.
+                                        if adopt_term_if_newer(&term_for_hb, &role_for_hb, ack_term) {
+                                            *last_heartbeat_for_hb.lock().unwrap() = Instant::now();
+                                        }
                                     }
                                 }
                             }
