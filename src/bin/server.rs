@@ -1,4 +1,5 @@
 use kv_store::{Command, Response, KvStore};
+use rand::Rng;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout, Duration};
@@ -13,29 +14,55 @@ enum Role {
     Leader,
 }
 
-async fn request_vote(peer_addr: String, term: u64) -> Option<Response> {
-    let mut stream = match timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
-        Ok(Ok(s)) => s,
-        _ => {
-            println!("Election: peer {} unreachable, no vote counted.", peer_addr);
-            return None;
+fn random_election_timeout() -> Duration {
+    Duration::from_millis(rand::thread_rng().gen_range(500..1000))
+}
+
+/// Adopts `incoming_term` and steps down to `Follower` if it's newer than the locally known
+/// term. Returns whether it was adopted. This is the only way a stale `Candidate`/`Leader`
+/// learns it's behind, whether via a `RequestVote`, a `Heartbeat`, or a `HeartbeatAck`.
+fn adopt_term_if_newer(local_term: &Mutex<u64>, role: &Mutex<Role>, incoming_term: u64) -> bool {
+    let mut term = local_term.lock().unwrap();
+    if incoming_term > *term {
+        *term = incoming_term;
+        let mut current_role = role.lock().unwrap();
+        if *current_role != Role::Follower {
+            println!("Stepping down to FOLLOWER: saw higher term {}.", incoming_term);
+            *current_role = Role::Follower;
         }
-    };
+        true
+    } else {
+        false
+    }
+}
 
-    let cmd = Command::RequestVote { term };
-    let payload = bincode::serialize(&cmd).ok()?;
-    let len_bytes = (payload.len() as u32).to_be_bytes();
+async fn request_vote(peer_addr: String, term: u64) -> Option<Response> {
+    let result = timeout(Duration::from_millis(150), async {
+        let mut stream = TcpStream::connect(&peer_addr).await.ok()?;
 
-    stream.write_all(&len_bytes).await.ok()?;
-    stream.write_all(&payload).await.ok()?;
+        let cmd = Command::RequestVote { term };
+        let payload = bincode::serialize(&cmd).ok()?;
+        let len_bytes = (payload.len() as u32).to_be_bytes();
 
-    let mut resp_len_buf = [0u8; 4];
-    stream.read_exact(&mut resp_len_buf).await.ok()?;
-    let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-    let mut resp_payload = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_payload).await.ok()?;
+        stream.write_all(&len_bytes).await.ok()?;
+        stream.write_all(&payload).await.ok()?;
 
-    bincode::deserialize(&resp_payload).ok()
+        let mut resp_len_buf = [0u8; 4];
+        stream.read_exact(&mut resp_len_buf).await.ok()?;
+        let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+        let mut resp_payload = vec![0u8; resp_len];
+        stream.read_exact(&mut resp_payload).await.ok()?;
+
+        bincode::deserialize::<Response>(&resp_payload).ok()
+    }).await;
+
+    match result {
+        Ok(response) => response,
+        Err(_) => {
+            println!("Election: peer {} unreachable or unresponsive within timeout, no vote counted.", peer_addr);
+            None
+        }
+    }
 }
 
 #[tokio::main]
@@ -62,6 +89,7 @@ async fn main() {
     {
         let heartbeat_peers = peers.clone();
         let role_for_sender = role.clone();
+        let term_for_sender = term.clone();
 
         tokio::spawn(async move {
             loop {
@@ -71,12 +99,16 @@ async fn main() {
                     continue;
                 }
 
+                let current_term = *term_for_sender.lock().unwrap();
+
                 for peer in &heartbeat_peers {
                     let peer_addr = peer.clone();
+                    let role_for_hb = role_for_sender.clone();
+                    let term_for_hb = term_for_sender.clone();
 
                     tokio::spawn(async move {
                         if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(150), TcpStream::connect(&peer_addr)).await {
-                            let hb = Command::Heartbeat;
+                            let hb = Command::Heartbeat { term: current_term };
                             let payload = bincode::serialize(&hb).unwrap();
                             let len_bytes = (payload.len() as u32).to_be_bytes();
 
@@ -87,7 +119,13 @@ async fn main() {
                             if stream.read_exact(&mut resp_len_buf).await.is_ok() {
                                 let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
                                 let mut resp_payload = vec![0u8; resp_len];
-                                let _ = stream.read_exact(&mut resp_payload).await;
+                                if stream.read_exact(&mut resp_payload).await.is_ok() {
+                                    if let Ok(Response::HeartbeatAck { term: ack_term }) = bincode::deserialize::<Response>(&resp_payload) {
+                                        // A follower that has seen a newer term means someone else
+                                        // won an election we don't know about yet; step down.
+                                        adopt_term_if_newer(&term_for_hb, &role_for_hb, ack_term);
+                                    }
+                                }
                             }
                         }
                     });
@@ -103,6 +141,8 @@ async fn main() {
         let election_peers = peers.clone();
 
         tokio::spawn(async move {
+            let mut election_timeout = random_election_timeout();
+
             loop {
                 sleep(Duration::from_millis(100)).await;
 
@@ -112,15 +152,21 @@ async fn main() {
 
                 let elapsed = follower_timer.lock().unwrap().elapsed();
 
-                if elapsed > Duration::from_millis(500) {
+                if elapsed > election_timeout {
+                    // Re-roll now so the next wait window (whether this election wins, loses,
+                    // or gets preempted by another node's heartbeat/vote request) uses a fresh
+                    // randomized timeout, keeping repeat candidates from splitting votes forever.
+                    election_timeout = random_election_timeout();
+
                     *role_for_watchdog.lock().unwrap() = Role::Candidate;
                     println!(
-                        "Timeout: no heartbeat in {}ms. Becoming CANDIDATE (election not yet implemented).",
+                        "Timeout: no heartbeat in {}ms. Becoming CANDIDATE.",
                         elapsed.as_millis()
                     );
 
                     let term_for_election = term_for_election.clone();
                     let role_for_election = role_for_watchdog.clone();
+                    let last_heartbeat_for_election = follower_timer.clone();
                     let election_peers = election_peers.clone();
 
                     tokio::spawn(async move {
@@ -159,7 +205,9 @@ async fn main() {
                                 println!("Election for term {} won but term has since advanced; discarding stale result.", current_term);
                             }
                         } else {
-                            println!("Election for term {} failed to reach majority. Remaining CANDIDATE (no retry).", current_term);
+                            println!("Election for term {} failed to reach majority. Reverting to FOLLOWER to retry after next timeout.", current_term);
+                            *role_for_election.lock().unwrap() = Role::Follower;
+                            *last_heartbeat_for_election.lock().unwrap() = Instant::now();
                         }
                     });
                 }
@@ -233,29 +281,36 @@ async fn main() {
                                 }
                             }
 
-                            Command::Heartbeat => {
-                                *last_heartbeat_clone.lock().unwrap() = Instant::now();
-                                println!("Received heartbeat");
-                                Response::Ok
+                            Command::Heartbeat { term: incoming_term } => {
+                                let adopted = adopt_term_if_newer(&term_clone, &role_clone, incoming_term);
+                                let local_term = *term_clone.lock().unwrap();
+
+                                if incoming_term < local_term {
+                                    // Stale leader from an old term; ignore for timeout purposes
+                                    // so it can't suppress a legitimate election.
+                                    println!("Ignoring stale heartbeat for term {} (local term is {}).", incoming_term, local_term);
+                                } else {
+                                    if !adopted {
+                                        // Term was already current; if we were still Candidate for
+                                        // it, someone else's election won it first.
+                                        let mut current_role = role_clone.lock().unwrap();
+                                        if *current_role == Role::Candidate {
+                                            println!("Stepping down to FOLLOWER: heartbeat for current term {} from elected leader.", incoming_term);
+                                            *current_role = Role::Follower;
+                                        }
+                                    }
+                                    *last_heartbeat_clone.lock().unwrap() = Instant::now();
+                                    println!("Received heartbeat for term {}.", incoming_term);
+                                }
+
+                                Response::HeartbeatAck { term: local_term }
                             }
 
                             Command::RequestVote { term: incoming_term } => {
-                                let mut local_term = term_clone.lock().unwrap();
-                                let vote_granted = incoming_term > *local_term;
+                                let vote_granted = adopt_term_if_newer(&term_clone, &role_clone, incoming_term);
+                                let current_term = *term_clone.lock().unwrap();
 
                                 if vote_granted {
-                                    *local_term = incoming_term;
-                                }
-                                let current_term = *local_term;
-                                drop(local_term);
-
-                                if vote_granted {
-                                    let mut current_role = role_clone.lock().unwrap();
-                                    if *current_role != Role::Follower {
-                                        println!("Stepping down to FOLLOWER: saw higher term {} in RequestVote.", incoming_term);
-                                        *current_role = Role::Follower;
-                                    }
-                                    drop(current_role);
                                     *last_heartbeat_clone.lock().unwrap() = Instant::now();
                                     println!("Granted vote for term {}.", incoming_term);
                                 } else {
