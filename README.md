@@ -229,9 +229,7 @@ for building on as a client library.
 Deployment is manual:
 
 - **`./deploy_local.sh`** rebuilds the Docker image and runs it on this machine
-  as `laptop-leader` with `PEERS=192.168.1.120:7878`. Despite the name, the
-  container starts as a follower like every other node. The script also still
-  sets `IS_LEADER=true`, which the server no longer reads.
+  as `local_node` with `PEERS=192.168.1.120:7878`.
 - **`./deploy_pi.sh`** cross-compiles for `linux/arm64` with `docker buildx`,
   copies the image to a Raspberry Pi (`node0` in SSH config) over `scp`, and
   restarts the `rpi-server` container there.
