@@ -319,13 +319,6 @@ most of the gaps below come from that.
 - **Terms aren't saved to disk.** A restarted node goes back to term 0, so it
   can vote again in a term it already voted in before the crash. That can
   produce two leaders in the same term.
-- **A node that steps down can immediately start an election of its own.**
-  When a leader or candidate learns about a higher term from a reply rather
-  than from the new leader's heartbeat, it becomes a follower without
-  resetting its election timer. If that timer has already run out, it starts
-  an election right away and can take leadership from a perfectly healthy
-  leader. Scenario 7 of the demo shows this in roughly half of runs: the
-  reconnected node steps down and then wins the next term.
 - **Writes are acknowledged before they're replicated.** If the leader dies
   right after replying `Ok`, the write may exist only on the old leader.
 - **Log entries have no term or index.** Nodes can't compare logs, figure out
