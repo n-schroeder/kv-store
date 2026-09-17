@@ -7,11 +7,11 @@ anything. Once a client sees `Ok`, that write survives any single node dying.
 I'm building it as a learning project for distributed-systems fundamentals, so
 the code favors being easy to read over being feature-complete.
 
-## See leader election in action
+## See it survive things
 
-The fastest way to see what this project does is the election demo. It starts
-a 5-node cluster in Docker, breaks it in nine different ways, and shows you
-what the nodes do about it:
+The fastest way to see what this project does is the demo. It starts a 5-node
+cluster in Docker, breaks it in nine different ways, and shows you what the
+nodes do about it:
 
 ```bash
 ./demo/election-demo.sh
@@ -28,10 +28,14 @@ For each one it:
 
 1. explains what's about to happen and what the cluster should do,
 2. makes it happen,
-3. prints the election-related log lines from all five nodes as one timeline,
-   with the constant heartbeat traffic filtered out, and
+3. prints the relevant log lines from all five nodes as one timeline, with the
+   constant heartbeat traffic filtered out, and
 4. checks that the cluster ended up in the right state, then prints PASS or
    FAIL.
+
+Scenarios 1–7 are about **elections**: who leads, and how the cluster agrees on
+that. Scenarios 8 and 9 follow the **data**, and are the ones that check the
+claim at the top of this README — that an acknowledged write survives.
 
 | # | Scenario | What it shows |
 |---|---|---|
@@ -42,6 +46,8 @@ For each one it:
 | 5 | Lose the majority | Two nodes can't win an election, so they keep retrying as the term climbs |
 | 6 | Restart the dead nodes | The cluster gets its majority back and settles on one leader |
 | 7 | Cut the leader off from the network, then reconnect it | The rest of the cluster moves on without it; once reconnected, it sees the newer term and steps down |
+| 8 | A node misses writes while it's down, then catches up | A follower is killed, ten keys are written without it, and it reconciles on its own when it returns — no client replays anything |
+| 9 | A partitioned leader's uncommitted write is rolled back | A write sent to a cut-off leader is refused rather than acknowledged, and the entry is truncated when it rejoins. What was never promised is never kept |
 
 Here's part of scenario 7 from a real run:
 
@@ -63,6 +69,52 @@ Right now node2 leads term 16, while node3 is cut off and still thinks it leads 
 ✓ PASS  node3 stepped down after reconnecting, and node2 is the only leader (term 16).
 ```
 
+Scenario 8 is the whole catch-up story in seven lines. node2 was killed, ten
+keys were written without it, and this is it coming back:
+
+```
+node1 has committed through index 15 while node2 was down. Restarting node2...
+
+  23:37:45.272  node2  Log restored: 5 entries, last term 17.
+  23:37:45.272  node2  Restored Raft state: term 17, voted for None, commit index 5.
+  23:37:45.272  node2  Database booted. Restored 0 keys by replaying 5 committed entries.
+  23:37:45.385  node2  Received 10 entries for term 17 (after index 5).
+  23:37:45.390  node2  Commit index advanced to 15.
+  23:37:45.392  node1  Node node2:7878 is reachable again.
+
+✓ PASS  node2 rejoined ten entries behind and caught up to commit index 15 on its own.
+```
+
+It comes back at index 5, the leader works out that's where they diverge, sends
+the ten entries it's missing in one batch, and it's current again — about 120ms
+after boot, with nothing replayed by hand.
+
+Scenario 9 is the one that checks a promise was never broken. A leader is cut
+off from the network and handed a write. It can't replicate, so it can't commit,
+so the client is told the write did **not** succeed — and the entry is thrown
+away when the node rejoins:
+
+```
+The write to the cut-off node1 was refused, as it should be:
+  error: index 16 not committed within 2s; this is unknown, not failed — it may still commit
+
+node2 now leads term 18 and has committed through index 17. Reconnecting node1...
+
+  23:37:48.412  node2  Starting election for term 18. Log ends at (17, 15).
+  23:37:48.566  node2  Won election for term 18 with 4 votes. Becoming LEADER.
+  23:37:52.030  node1  Stepping down to FOLLOWER: saw higher term 18.
+  23:37:52.075  node1  Received 2 entries for term 18 (after index 15).
+  23:37:52.075  node1  Truncating diverged log from index 16 (ours term 17, leader's term 18).
+  23:37:52.077  node1  Commit index advanced to 17.
+
+✓ PASS  node1 truncated the entry it never committed and caught up to node2's log at index 17.
+```
+
+Index 16 is the write the cut-off node accepted into its own log. The cluster
+elected node2 and put its own entry at 16 instead. When node1 came back, the
+terms disagreed there, so it dropped its version and took node2's. The write is
+gone — which is fine, because nobody was ever told it succeeded.
+
 Options:
 
 - `--no-pause` runs every scenario back to back without waiting for Enter.
@@ -79,11 +131,17 @@ different on every run. That's expected.
 ## Quick start
 
 ```bash
-cargo build --release --bin server   # build the server binary (what the Dockerfile builds)
-cargo run --bin server               # run a node locally (listens on 0.0.0.0:7878, writes ./wal.log)
-cargo run --bin client               # load test: 100 concurrent SETs, then 1 GET, against localhost:7878
-cargo test                           # run the tests (currently just test_serialization in src/lib.rs)
+cargo build --release                       # build both binaries (what the Dockerfile builds)
+cargo run --bin server                      # run a node (0.0.0.0:7878; writes ./wal.log and ./raft-state.bin)
+cargo run --bin client -- 127.0.0.1:7878 set greeting hello
+cargo run --bin client -- 127.0.0.1:7878 get greeting
+cargo run --bin client                      # load test: 100 concurrent SETs, then 1 GET
+cargo test                                  # run the tests, all inline in src/lib.rs
+cargo test wal_                             # just the WAL recovery tests
 ```
+
+A node on its own is a single-node cluster: it elects itself and commits
+immediately, which is the quickest way to try the store without Docker.
 
 A node finds the rest of the cluster through the `PEERS` environment variable,
 a comma-separated list of `host:port` addresses that doesn't include the node
@@ -93,22 +151,29 @@ itself:
 PEERS=node2:7878,node3:7878 cargo run --bin server
 ```
 
-The port (`7878`) and the server's WAL path (`wal.log`) are hardcoded, so you can only run
-one node per machine. To run a multi-node cluster on one machine, put each
-node in its own Docker container. `demo/compose.yaml` does exactly that for
-five nodes.
+`NODE_ID` sets the node's own dialable address — the identity it records when
+it votes, and the address a follower hands back when it redirects a client. It
+defaults to the machine's hostname on port 7878.
+
+The port (`7878`) and the two state files (`wal.log`, `raft-state.bin`) are
+hardcoded relative paths, so you can only run one node per directory. To run a
+multi-node cluster on one machine, put each node in its own Docker container.
+`demo/compose.yaml` does exactly that for five nodes.
 
 There's no lint config and no `tests/` directory. All tests live inline in
-`src/lib.rs` under `#[cfg(test)]`.
+`src/lib.rs` under `#[cfg(test)]`. They cover WAL round-tripping, recovery from
+a torn tail, a corrupted checksum, a stale suffix that still passes its CRC,
+rejection of a v1 log, log truncation and conflict resolution, the election
+restriction, and a vote surviving a simulated restart.
 
 ## Project layout
 
 | File | What it does |
 |---|---|
-| `src/lib.rs` | `Wal` (checksummed append-only log), `KvStore` (in-memory map + WAL), `RaftStateStore` (durable term/vote), and the `Command` / `Response` message types |
-| `src/bin/server.rs` | Networking, leader election, heartbeats, and replication |
-| `src/bin/client.rs` | A load-testing tool, not a client library |
-| `demo/election-demo.sh` | Runs the leader election demo described above |
+| `src/lib.rs` | `Wal` (checksummed append-only records), `RaftLog` (those records as `LogEntry`s), `KvStore` (the state machine), `RaftStateStore` (durable term/vote/commit), and the `Command` / `Response` message types |
+| `src/bin/server.rs` | The `Node` struct and everything it does: networking, elections, replication, commit, and the client-facing handlers |
+| `src/bin/client.rs` | A command-line client and load-test tool, not a client library |
+| `demo/election-demo.sh` | Runs the nine-scenario demo described above |
 | `demo/compose.yaml` | The 5-node Docker Compose cluster the demo uses |
 
 ## Messages and framing
@@ -211,18 +276,25 @@ A node's identity in `votedFor` comes from `NODE_ID`, its own dialable address
 Every node starts as a `Follower`. There's no configured leader. The cluster
 picks one on its own and picks a new one when the current leader goes away.
 
-Each node tracks three pieces of in-memory state:
+Everything a node is lives in one `Node` struct, shared behind an `Arc`. The
+parts that drive elections:
 
 - **`role`**: `Follower`, `Candidate`, or `Leader`
 - **`term`**: a number that goes up by one with every election. Terms let nodes
   tell current information from stale information.
+- **`voted_for`**: who this node promised its vote to in the current term
 - **`last_heartbeat`**: when this node last heard from a legitimate leader
 
-None of these are saved to disk, so a restarted node comes back as a
-`Follower` in term 0. All three use `std::sync::Mutex`, because each access is a
-quick read or write that's never held across an `.await`.
+`term` and `voted_for` are **saved to disk** before the node acts on them, so a
+restarted node comes back knowing what it already promised. `role` and
+`last_heartbeat` are not: a node always restarts as a `Follower` and waits out
+an election timeout, which is correct — a leader has to re-earn the job.
 
-### Heartbeats
+These all use `std::sync::Mutex`, because each access is a quick read or write
+that's never held across an `.await`. The log is the exception: it sits behind a
+`tokio` mutex, because touching it means disk I/O.
+
+### Heartbeats are empty `AppendEntries`
 
 Every 150ms, the leader sends each peer an `AppendEntries` carrying whatever
 entries that peer is missing. When a peer is caught up there are no entries to
@@ -255,12 +327,17 @@ A watchdog on each node checks every 100ms. If the node is a `Follower` and
 hasn't heard a heartbeat within its **election timeout**, it becomes a
 `Candidate` and starts an election:
 
-1. Increment `term` and vote for itself.
-2. Send `RequestVote { term }` to every peer at the same time.
+1. Increment `term`, vote for itself, and **`fsync` that before going any
+   further** — a self-vote is as binding as any other, and a node that crashed
+   here and forgot it could hand the same term to someone else.
+2. Send `RequestVote { term, candidate_id, last_log_index, last_log_term }` to
+   every peer at the same time. The log fields let each peer refuse a candidate
+   whose log is behind its own.
 3. Count the votes. A majority of the whole cluster wins, counting the node
    itself: 2 of 3 nodes, 3 of 5.
 4. If it has a majority *and* its term hasn't changed since the election
-   started, become `Leader` and start sending heartbeats.
+   started, become `Leader`, append a no-op entry of the new term, and start
+   sending heartbeats.
 
 The term check in step 4 prevents a real bug. While votes are still coming
 in, the node may already have moved to a newer term. If a late win were still
@@ -318,18 +395,20 @@ a single helper, `adopt_term_if_newer`, which runs in three places:
 | Heartbeat interval | 150ms | Comfortably shorter than the smallest election timeout |
 | Watchdog check interval | 100ms | How often a follower checks whether its leader has gone quiet |
 | Election timeout | random 500–1000ms | Randomized so candidates don't keep splitting the vote |
-| Peer connect timeout | 150ms | Makes an unreachable peer fail fast |
-| `RequestVote` round trip | 150ms total | Covers connect, send, and reply, so one slow peer can't stall an election |
+| Peer RPC round trip | 150ms total | Covers connect, send, and reply, for `AppendEntries` and `RequestVote` alike |
+| Client write commit wait | 2s | How long a write waits for a majority before the client is told the result is unknown |
+| Entries per `AppendEntries` | 64 max | Caps how much a badly lagging follower pulls per round trip |
 
-The connect timeout exists for a reason. Without it, connecting to a dead peer
-could hang longer than the election timeout. In a 3-node test with one node
-killed, the two survivors kept starting overlapping elections and churned
-through 10 terms in about 5 seconds without ever settling on a leader.
+Bounding the *whole* peer exchange, not just the connect, matters. A peer that
+accepts a connection and then goes quiet would otherwise hold an election open
+past the election timeout. In a 3-node test with one node killed, the two
+survivors kept starting overlapping elections and churned through 10 terms in
+about 5 seconds without ever settling on a leader.
 
 ### What it looks like
 
 To watch all of this on your own machine, run the
-[election demo](#see-leader-election-in-action). Here's the start of a 5-node
+[demo](#see-it-survive-things). Here's the start of a 5-node
 cluster, with heartbeat lines filtered out:
 
 ```
@@ -423,8 +502,21 @@ Deployment is manual:
   copies the image to a Raspberry Pi (`node0` in SSH config) over `scp`, and
   restarts the `rpi-server` container there.
 
-Both scripts bind-mount a host directory to `/app`, the container's working
-directory, which is what keeps `wal.log` around across restarts and redeploys.
+Both scripts set `NODE_ID` from the host's primary LAN address, and bind-mount a
+host directory to `/app`, the container's working directory, which is what keeps
+`wal.log` and `raft-state.bin` around across restarts and redeploys.
+
+Two things to know before trusting this deployment:
+
+- **An existing `wal.log` from before the checksummed format won't load.** The
+  node refuses to start and tells you to move the file aside, rather than
+  misreading records that carry no term, index, or CRC. Moving it aside starts a
+  fresh, empty log — the old data isn't migrated.
+- **`deploy_pi.sh` sets no `PEERS`,** so the Pi thinks it's a single-node
+  cluster, elects itself, and commits writes on its own authority with the
+  laptop none the wiser. That was survivable when replication was best-effort;
+  now that writes commit on a majority it means two independent clusters. Worth
+  fixing before relying on it.
 
 ## Known limitations
 

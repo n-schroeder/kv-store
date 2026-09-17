@@ -609,6 +609,10 @@ scenario_catch_up() {
         || { show_logs 50; fail "node$leader committed only up to index $target after ten writes."; }
 
     say "node$leader has committed through index $target while node$victim was down. Restarting node$victim..."
+
+    # Re-mark so the timeline below shows only the reconciliation. The ten
+    # writes themselves are ~80 lines of routine replication that would bury it.
+    mark_logs
     start_node "$victim"
 
     wait_for_commit "$victim" "$target" \
