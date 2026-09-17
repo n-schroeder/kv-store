@@ -16,9 +16,15 @@ ssh $PI_TARGET << 'EOF'
   sudo docker stop rpi-server || true
   sudo docker rm rpi-server || true
 
+  # The Pi's own dialable address, as its peers would reach it: the node's Raft
+  # identity for votedFor and leader redirects. Detected on the Pi itself.
+  PI_NODE_ID="$(hostname -I | awk '{print $1}'):7878"
+  echo "This node's ID: $PI_NODE_ID"
+
   sudo docker run -d \
     -p 7878:7878 \
     -v ~/dev/data/kv-store:/app \
+    -e NODE_ID="$PI_NODE_ID" \
     --name rpi-server \
     kv-server-arm64
  

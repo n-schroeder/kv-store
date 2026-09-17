@@ -92,7 +92,7 @@ itself:
 PEERS=node2:7878,node3:7878 cargo run --bin server
 ```
 
-The port (`7878`) and WAL path (`wal.log`) are hardcoded, so you can only run
+The port (`7878`) and the server's WAL path (`wal.log`) are hardcoded, so you can only run
 one node per machine. To run a multi-node cluster on one machine, put each
 node in its own Docker container. `demo/compose.yaml` does exactly that for
 five nodes.
@@ -104,7 +104,7 @@ There's no lint config and no `tests/` directory. All tests live inline in
 
 | File | What it does |
 |---|---|
-| `src/lib.rs` | `KvStore` (in-memory map + WAL) and the `Command` / `Response` message types |
+| `src/lib.rs` | `Wal` (checksummed append-only log), `KvStore` (in-memory map + WAL), `RaftStateStore` (durable term/vote), and the `Command` / `Response` message types |
 | `src/bin/server.rs` | Networking, leader election, heartbeats, and replication |
 | `src/bin/client.rs` | A load-testing tool, not a client library |
 | `demo/election-demo.sh` | Runs the leader election demo described above |
@@ -115,38 +115,76 @@ There's no lint config and no `tests/` directory. All tests live inline in
 Everything a node sends or stores is one of two enums:
 
 - `Command`: `Set { key, value }`, `Get { key }`, `Heartbeat { term }`,
-  `RequestVote { term }`
+  `RequestVote { term, candidate_id }`
 - `Response`: `Ok`, `Value(Option<Vec<u8>>)`, `Error(String)`,
   `VoteResponse { term, vote_granted }`, `HeartbeatAck { term }`
 
-Each message is serialized with bincode and framed the same way everywhere:
-a 4-byte big-endian `u32` length prefix, then the payload. That goes for
-client traffic, node-to-node traffic, and the records in `wal.log`.
+Both are serialized with bincode. The framing around that payload differs by
+destination:
 
-Sharing one encoding keeps the serialization code in one place, but it couples
-things together. If you change either enum, the network code in `server.rs` and
-`client.rs` and the WAL code in `lib.rs` have to change with it. Existing
-`wal.log` files stop being readable, and every node in a cluster has to run
-the same build, since old and new binaries can't decode each other's messages.
+- **On the network** (client traffic and node-to-node traffic): a 4-byte
+  big-endian `u32` length prefix, then the payload.
+- **On disk** (`wal.log`): an 8-byte file header `KVWALOG\x02`, then records of
+  a 4-byte big-endian length, a 4-byte big-endian CRC32 of the payload, then
+  the payload.
+
+The disk format carries a checksum because a file outlives the process that
+wrote it and has to be defended against half-written records; a TCP stream
+doesn't. The header's trailing byte is a format version, so a log written by
+an incompatible build is rejected at startup instead of misread.
+
+One bincode encoding still means the enums are shared: change either one and
+the network code in `server.rs` / `client.rs` and the WAL code in `lib.rs` have
+to change with it, and every node in a cluster has to run the same build, since
+old and new binaries can't decode each other's messages.
 
 ## Storage: `KvStore`
 
 `KvStore` keeps the data in a `HashMap<String, Vec<u8>>` behind an
-`Arc<RwLock<_>>`, with the WAL file behind an `Arc<Mutex<_>>`.
+`Arc<RwLock<_>>`, with a `Wal` behind an `Arc<Mutex<_>>`. `Wal` owns the file
+and all of the framing, so `KvStore` never touches raw bytes.
 
-- **Startup (`KvStore::open`)** reads `wal.log` from the start and replays every
-  `Set` record into the map, so the last write to a key wins. It then reopens
-  the file in append mode. Replay ignores every other record type. Nothing ever
-  compacts the log, so it grows forever and gets fully replayed on every boot.
-- **Writes (`KvStore::set`)** append the record to the WAL and call `flush()`,
-  and only then update the map. The WAL lock is released before the map lock
-  is taken, so the two are never held at the same time. `flush()` isn't an
-  `fsync`, though, so a write can still be lost if the machine loses power
-  right after it.
+- **Startup (`KvStore::open`)** replays `wal.log` and applies every `Set` record
+  to the map, so the last write to a key wins. Replay ignores every other record
+  type. Nothing ever compacts the log, so it grows forever and gets fully
+  replayed on every boot.
+- **Writes (`KvStore::set`)** append the record to the WAL and `fsync` it, and
+  only then update the map. The WAL lock is released before the map lock is
+  taken, so the two are never held at the same time. One `fsync` per write is
+  slow, and that's the accepted trade: a write that returned has reached the
+  disk, not just the page cache.
 - **Reads (`KvStore::get`)** only look at the in-memory map.
 
-Most I/O calls `.unwrap()`, so a disk error crashes the task instead of being
-handled. That includes WAL replay at startup.
+I/O errors are returned rather than unwrapped, so a failed write becomes a
+`Response::Error` to the client instead of a dead connection task.
+
+### Surviving a crash mid-write
+
+A process killed partway through an append leaves a record with a truncated
+payload, or a length prefix with nothing behind it. Recovery reads records until
+one is short, absurdly long, or fails its CRC, then truncates the file at the
+end of the last intact record and carries on. A half-written record costs you
+that one write; it doesn't stop the node from booting.
+
+The checksum catches bit-rot and torn payloads. It cannot catch a *stale* record
+— one that was logically truncated but whose bytes survived, since those records
+are perfectly intact. Catching that needs the entry index, which arrives with
+log replication.
+
+### Raft state that outlives the process: `raft-state.bin`
+
+`currentTerm` and `votedFor` are written to `raft-state.bin` next to the WAL,
+and flushed **before** the node acts on them: before it answers a `RequestVote`,
+and before it asks for votes in a new term. Without that ordering, a node that
+crashed after voting would come back at term 0 and could vote a second time in a
+term it had already promised away — which elects two leaders at once.
+
+The file is written by writing a temp file, `fsync`ing it, renaming it over the
+real one, and `fsync`ing the directory, so a torn state file is never
+observable. It also carries a `commitIndex`, unused until log replication lands.
+
+A node's identity in `votedFor` comes from `NODE_ID`, its own dialable address
+(`node3:7878`), defaulting to the container hostname.
 
 ## Leader election
 
@@ -313,12 +351,10 @@ directory, which is what keeps `wal.log` around across restarts and redeploys.
 
 ## Known limitations
 
-Leader election is in reasonable shape. The data path isn't Raft yet, and
-most of the gaps below come from that.
+Leader election is in reasonable shape, and a node now survives a crash without
+losing acknowledged writes or forgetting its vote. The data path still isn't
+Raft, and the gaps below come from that.
 
-- **Terms aren't saved to disk.** A restarted node goes back to term 0, so it
-  can vote again in a term it already voted in before the crash. That can
-  produce two leaders in the same term.
 - **Writes are acknowledged before they're replicated.** If the leader dies
   right after replying `Ok`, the write may exist only on the old leader.
 - **Log entries have no term or index.** Nodes can't compare logs, figure out
@@ -334,8 +370,7 @@ most of the gaps below come from that.
 - **Followers accept writes from clients** and apply them locally without
   forwarding them to the leader.
 - **Reads can be stale,** because any node answers `Get` from its own data.
-- **A half-written WAL record crashes startup.** The replay loop unwraps every
-  read, so a record cut off by a crash stops the node from booting.
-- **`flush()` isn't `fsync`,** so a power loss can drop recent writes.
+- **The log is never compacted.** `wal.log` grows without bound and is replayed
+  in full on every boot; there's no snapshotting.
 - **The WAL is never compacted.** It grows forever and is fully replayed on
   every boot.

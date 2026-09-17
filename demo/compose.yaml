@@ -11,22 +11,27 @@ services:
   node1:
     <<: *node
     environment:
+      NODE_ID: node1:7878
       PEERS: node2:7878,node3:7878,node4:7878,node5:7878
   node2:
     <<: *node
     environment:
+      NODE_ID: node2:7878
       PEERS: node1:7878,node3:7878,node4:7878,node5:7878
   node3:
     <<: *node
     environment:
+      NODE_ID: node3:7878
       PEERS: node1:7878,node2:7878,node4:7878,node5:7878
   node4:
     <<: *node
     environment:
+      NODE_ID: node4:7878
       PEERS: node1:7878,node2:7878,node3:7878,node5:7878
   node5:
     <<: *node
     environment:
+      NODE_ID: node5:7878
       PEERS: node1:7878,node2:7878,node3:7878,node4:7878
 
 networks:
