@@ -434,7 +434,10 @@ fn resolve_node_id() -> String {
         })
         .unwrap_or_else(|| "unknown-node".to_string());
 
-    if raw.contains(':') { raw } else { format!("{}:7878", raw) }
+    match raw.contains(':') {
+        true => raw,
+        false => format!("{}:7878", raw),
+    }
 }
 
 #[tokio::main]

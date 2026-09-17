@@ -175,7 +175,7 @@ impl Wal {
             return Ok(None);
         }
 
-        Ok(Some(payload))
+        Ok(Some(payload.to_vec()))
     }
 
     /// Appends one record and `fsync`s it, returning the offset it starts at.
