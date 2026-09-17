@@ -16,13 +16,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/compose.yaml"
 NETWORK="kv-election-demo"
 NODES="1 2 3 4 5"
-TOTAL_SCENARIOS=7
+TOTAL_SCENARIOS=9
 WAIT_TIMEOUT=45       # seconds to wait for the cluster to reach an expected state
 OBSERVE_SECONDS=8     # how long to watch a cluster that shouldn't elect anyone
 
 # Log lines that aren't about elections. The first heartbeat a node receives is
 # sometimes shown anyway, when it's the evidence a scenario is looking for.
-NOISE='Received heartbeat for term|New client connected|disconnected gracefully|listening on port|Role: FOLLOWER|Peers: '
+BASE_NOISE='Received heartbeat for term|New client connected|disconnected gracefully|listening on port|Role: FOLLOWER|Peers: |Node ID: |The client (wants|is asking)'
+
+# Replication lines are hidden in the election scenarios, where they're only
+# churn from each new leader's no-op entry. The two data scenarios shadow NOISE
+# with BASE_NOISE, because there they're the whole point.
+REPLICATION_NOISE='Commit index advanced to|Received [0-9]+ entries for term|Log restored|Database booted|Restored Raft state|rejected entries at index|Truncating diverged log'
+NOISE="$BASE_NOISE|$REPLICATION_NOISE"
 
 PAUSE=1
 KEEP=0
@@ -251,6 +257,38 @@ wait_for_followers() {
         wait_for_log "$n" "Received heartbeat for term $term\." || return 1
     done
     return 0
+}
+
+# Runs the bundled client inside node $1's container, against that node's own
+# listener. Using 127.0.0.1 rather than the service name means this still works
+# for a node that's been cut off from the cluster network. Redirects the client
+# follows still use service names, which resolve fine for connected nodes.
+kv() {
+    local n=$1
+    shift
+    dc exec -T "node$n" client 127.0.0.1:7878 "$@" 2>&1
+}
+
+# Prints the highest commit index node $1 has logged in its current run, or 0.
+commit_index() {
+    local line
+    line=$(current_run_logs "$1" | grep -E 'Commit index advanced to [0-9]+\.' | tail -n 1)
+    if [ -n "$line" ]; then
+        printf '%s\n' "$line" | sed -E 's/.*advanced to ([0-9]+)\..*/\1/'
+    else
+        printf '0\n'
+    fi
+}
+
+# Waits until node $1's commit index has reached at least $2.
+wait_for_commit() {
+    local deadline
+    deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ "$(commit_index "$1")" -ge "$2" ] && return 0
+        sleep 0.5
+    done
+    return 1
 }
 
 running_nodes_except() {
@@ -545,6 +583,104 @@ scenario_partition() {
     fi
 }
 
+scenario_catch_up() {
+    # Replication lines are the evidence here, so don't filter them out.
+    local NOISE="$BASE_NOISE"
+    local leader=$LEADER victim target got i
+
+    victim=$(running_nodes_except "$leader" | awk '{print $1}')
+    [ -n "$victim" ] || die "No follower available to knock over."
+
+    scenario 8 "A node misses writes while it's down, then catches up"
+    say "node$victim is killed. Ten keys are then written to node$leader, which still has the four-node majority it needs to commit them. node$victim comes back with a log ten entries short of everyone else's."
+    expect "node$leader backs its replication cursor up until it finds the last entry it and node$victim agree on, ships everything after it, and node$victim applies the lot. Its commit index catches up on its own -- no client replays anything, and nothing had to be written twice."
+    pause
+
+    mark_logs
+    kill_node "$victim"
+
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kv "$leader" set "catchup_$i" "value_$i" >/dev/null \
+            || { show_logs 50; fail "Writing catchup_$i to node$leader failed while $((5 - 1)) nodes were up."; }
+    done
+
+    target=$(commit_index "$leader")
+    [ "$target" -ge 10 ] \
+        || { show_logs 50; fail "node$leader committed only up to index $target after ten writes."; }
+
+    say "node$leader has committed through index $target while node$victim was down. Restarting node$victim..."
+    start_node "$victim"
+
+    wait_for_commit "$victim" "$target" \
+        || { show_logs 50; fail "node$victim never caught up to commit index $target (it reached $(commit_index "$victim"))."; }
+
+    got=$(kv "$victim" get catchup_7)
+    printf '%s\n' "$got" | grep -q '^value_7$' \
+        || { show_logs 50; fail "Reading catchup_7 back gave: $got"; }
+
+    show_logs 50
+    pass "node$victim rejoined ten entries behind and caught up to commit index $target on its own."
+}
+
+scenario_divergent_log() {
+    local NOISE="$BASE_NOISE"
+    local old old_term new new_term target ghost_write ghost_read
+
+    wait_for_leader || { show_logs; fail "No stable leader to start from."; }
+    old=$LEADER
+    old_term=$LEADER_TERM
+
+    scenario 9 "A partitioned leader's uncommitted write is rolled back"
+    say "node$old is cut off from the network while it still believes it leads term $old_term, and a write is sent to it. It appends the entry to its own log, but with no majority to replicate to it can never commit -- so the client is told the write did not succeed."
+    expect "The other four elect a new leader and commit writes of their own. When node$old reconnects, its log holds an entry the cluster never accepted. It steps down, the new leader backs up to the last index they agree on, and node$old truncates the diverged entry. The write that was never acknowledged stays gone."
+    pause
+
+    mark_logs
+    docker network disconnect "$NETWORK" "${CID[$old]}" >/dev/null \
+        || die "Couldn't disconnect node$old from the network."
+
+    ghost_write=$(kv "$old" set ghost never-committed)
+    case "$ghost_write" in
+        *OK*)
+            show_logs 50
+            fail "node$old acknowledged a write it had no majority to commit." ;;
+    esac
+    say "The write to the cut-off node$old was refused, as it should be:"
+    say "  ${DIM}${ghost_write}${RESET}"
+
+    wait_for_leader "$old" \
+        || { show_logs 50; fail "The connected nodes didn't elect a new leader within ${WAIT_TIMEOUT}s."; }
+    new=$LEADER
+    new_term=$LEADER_TERM
+    [ "$new_term" -gt "$old_term" ] \
+        || { show_logs 50; fail "node$new leads term $new_term, which isn't higher than $old_term."; }
+
+    kv "$new" set survivor committed >/dev/null \
+        || { show_logs 50; fail "The new leader node$new couldn't commit a write."; }
+    target=$(commit_index "$new")
+
+    say "node$new now leads term $new_term and has committed through index $target. Reconnecting node$old..."
+    pause "Press Enter to reconnect node$old..."
+
+    docker network connect --alias "node$old" "$NETWORK" "${CID[$old]}" >/dev/null \
+        || die "Couldn't reconnect node$old to the network."
+
+    wait_for_log "$old" "Truncating diverged log from index" \
+        || { show_logs 50; fail "node$old never truncated its diverged entry after reconnecting."; }
+    wait_for_commit "$old" "$target" \
+        || { show_logs 50; fail "node$old never caught up to commit index $target."; }
+
+    ghost_read=$(kv "$old" get ghost)
+    case "$ghost_read" in
+        *never-committed*)
+            show_logs 50
+            fail "The rolled-back write came back out of the cluster: $ghost_read" ;;
+    esac
+
+    show_logs 50
+    pass "node$old truncated the entry it never committed and caught up to node$new's log at index $target. The unacknowledged write stayed gone."
+}
+
 # ---------------------------------------------------------------------------
 
 main() {
@@ -554,10 +690,12 @@ main() {
     cat <<EOF
 
 This starts a 5-node kv-store cluster in Docker and runs it through $TOTAL_SCENARIOS
-failure scenarios: killing leaders, losing and regaining a majority, and
-cutting a leader off from the network. For each one it shows what the nodes
-logged about elections (the constant heartbeat traffic is filtered out) and
-checks that the cluster ended up where it should.
+scenarios: killing leaders, losing and regaining a majority, cutting a leader
+off from the network, and then two that follow the data -- a node catching up
+on writes it missed while it was down, and a partitioned leader rolling back a
+write it could never commit. For each one it shows what the nodes logged (the
+constant heartbeat traffic is filtered out) and checks that the cluster ended
+up where it should.
 
 Timestamps are in UTC. No ports are opened on this machine, and the cluster is
 removed when the demo exits.
@@ -578,6 +716,8 @@ EOF
     scenario_lose_majority
     scenario_regain_majority
     scenario_partition
+    scenario_catch_up
+    scenario_divergent_log
 
     echo
     say "${GREEN}${BOLD}All $PASSED of $TOTAL_SCENARIOS scenarios passed.${RESET}"

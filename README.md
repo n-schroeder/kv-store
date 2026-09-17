@@ -1,15 +1,16 @@
 # kv-store
 
-A small async key-value store written in Rust on top of tokio. Writes go
-through a write-ahead log (WAL) so data survives restarts, and the nodes in a
-cluster elect a leader using a stripped-down version of Raft's election
-protocol. I'm building it as a learning project for distributed-systems
-fundamentals, so the code favors being easy to read over being feature-complete.
+A small async key-value store written in Rust on top of tokio. Writes go into a
+checksummed write-ahead log that doubles as a Raft replicated log, and the nodes
+in a cluster elect a leader and replicate to a majority before acknowledging
+anything. Once a client sees `Ok`, that write survives any single node dying.
+I'm building it as a learning project for distributed-systems fundamentals, so
+the code favors being easy to read over being feature-complete.
 
 ## See leader election in action
 
 The fastest way to see what this project does is the election demo. It starts
-a 5-node cluster in Docker, breaks it in seven different ways, and shows you
+a 5-node cluster in Docker, breaks it in nine different ways, and shows you
 what the nodes do about it:
 
 ```bash
@@ -114,10 +115,18 @@ There's no lint config and no `tests/` directory. All tests live inline in
 
 Everything a node sends or stores is one of two enums:
 
-- `Command`: `Set { key, value }`, `Get { key }`, `Heartbeat { term }`,
-  `RequestVote { term, candidate_id }`
+- `Command`: `Set { key, value }`, `Get { key }`, `NoOp`,
+  `AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit }`,
+  `RequestVote { term, candidate_id, last_log_index, last_log_term }`
 - `Response`: `Ok`, `Value(Option<Vec<u8>>)`, `Error(String)`,
-  `VoteResponse { term, vote_granted }`, `HeartbeatAck { term }`
+  `VoteResponse { term, vote_granted }`,
+  `AppendEntriesAck { term, success, match_index, conflict_index }`,
+  `NotLeader { leader }`
+
+A WAL record's payload is a `LogEntry { term, index, command }` rather than a
+bare `Command`. Term and index live inside the payload, not the record frame:
+recovery decodes every record anyway, and the log keeps a byte offset per index
+in memory, so nothing needs those fields before decoding.
 
 Both are serialized with bincode. The framing around that payload differs by
 destination:
@@ -138,25 +147,31 @@ the network code in `server.rs` / `client.rs` and the WAL code in `lib.rs` have
 to change with it, and every node in a cluster has to run the same build, since
 old and new binaries can't decode each other's messages.
 
-## Storage: `KvStore`
+## Storage: `Wal`, `RaftLog` and `KvStore`
 
-`KvStore` keeps the data in a `HashMap<String, Vec<u8>>` behind an
-`Arc<RwLock<_>>`, with a `Wal` behind an `Arc<Mutex<_>>`. `Wal` owns the file
-and all of the framing, so `KvStore` never touches raw bytes.
+Three layers, each with one job:
 
-- **Startup (`KvStore::open`)** replays `wal.log` and applies every `Set` record
-  to the map, so the last write to a key wins. Replay ignores every other record
-  type. Nothing ever compacts the log, so it grows forever and gets fully
-  replayed on every boot.
-- **Writes (`KvStore::set`)** append the record to the WAL and `fsync` it, and
-  only then update the map. The WAL lock is released before the map lock is
-  taken, so the two are never held at the same time. One `fsync` per write is
-  slow, and that's the accepted trade: a write that returned has reached the
-  disk, not just the page cache.
-- **Reads (`KvStore::get`)** only look at the in-memory map.
+- **`Wal`** owns the file and all of the framing. It appends a record and
+  `fsync`s it before returning — one `fsync` per write, deliberately: a write
+  that returned has reached the disk, not just the page cache. It knows nothing
+  about what a payload means.
+- **`RaftLog`** reads those records as `LogEntry`s, and is the thing Raft
+  operates on: `last_index`, `term_at`, `entries_from`, `try_append`,
+  `truncate_from`. It keeps every entry and its byte offset in memory, so
+  turning an index into a file position is free.
+- **`KvStore`** is the state machine: a `HashMap<String, Vec<u8>>` behind an
+  `Arc<RwLock<_>>` and nothing else. It is deliberately *not* durable. The log
+  is the durable thing, and the map is only ever a replay of the log's
+  committed prefix.
 
-I/O errors are returned rather than unwrapped, so a failed write becomes a
-`Response::Error` to the client instead of a dead connection task.
+On startup a node replays its log and applies entries up to the commit index it
+had persisted. Committed entries are never truncated, so that prefix is always
+valid; the uncommitted tail stays in the log unapplied, ready to be discarded if
+it turns out to have diverged from the leader's.
+
+Nothing ever compacts the log, so it grows forever and is fully replayed on
+every boot. I/O errors are returned rather than unwrapped, so a failed write
+becomes an error to the client instead of a dead connection task.
 
 ### Surviving a crash mid-write
 
@@ -166,10 +181,12 @@ one is short, absurdly long, or fails its CRC, then truncates the file at the
 end of the last intact record and carries on. A half-written record costs you
 that one write; it doesn't stop the node from booting.
 
-The checksum catches bit-rot and torn payloads. It cannot catch a *stale* record
-— one that was logically truncated but whose bytes survived, since those records
-are perfectly intact. Catching that needs the entry index, which arrives with
-log replication.
+The checksum catches bit-rot and torn payloads. It cannot catch a *stale*
+record — one that was logically truncated but whose bytes survived. Those
+records are perfectly intact and checksum fine; what gives them away is their
+index. So recovery also checks that indexes run 1, 2, 3, … with no gaps and that
+terms never decrease, and truncates at the first entry that breaks either rule.
+That is what a crash partway through a log truncation looks like.
 
 ### Raft state that outlives the process: `raft-state.bin`
 
@@ -181,7 +198,10 @@ term it had already promised away — which elects two leaders at once.
 
 The file is written by writing a temp file, `fsync`ing it, renaming it over the
 real one, and `fsync`ing the directory, so a torn state file is never
-observable. It also carries a `commitIndex`, unused until log replication lands.
+observable. It also carries `commitIndex`. Raft treats that as volatile, but
+persisting it is what lets a node that restarts alone serve the data it already
+has instead of waiting to be told what it already knows. It is only ever a
+lower bound, and it is clamped to the log's length on boot.
 
 A node's identity in `votedFor` comes from `NODE_ID`, its own dialable address
 (`node3:7878`), defaulting to the container hostname.
@@ -204,8 +224,10 @@ quick read or write that's never held across an `.await`.
 
 ### Heartbeats
 
-Every 150ms, the leader sends `Heartbeat { term }` to each peer. When a node
-gets a heartbeat:
+Every 150ms, the leader sends each peer an `AppendEntries` carrying whatever
+entries that peer is missing. When a peer is caught up there are no entries to
+send and the message is empty — that empty `AppendEntries` *is* the heartbeat,
+so replication and liveness ride on the same message. When a node gets one:
 
 - **The heartbeat's term is newer than its own.** The node adopts that term,
   steps down to `Follower` if it wasn't one already, and resets its heartbeat
@@ -218,8 +240,8 @@ gets a heartbeat:
   its timer, so a stale leader can't keep the rest of the cluster from holding
   an election.
 
-Either way, the node replies with `HeartbeatAck { term }` carrying its own
-term. If that term is higher than the leader's, the leader learns it's been
+Either way, the node replies with an `AppendEntriesAck` carrying its own term.
+If that term is higher than the leader's, the leader learns it's been
 replaced and steps down. This is how a leader that was cut off from the
 cluster, or just fell behind, finds out an election happened without it.
 
@@ -247,11 +269,24 @@ applied, it would overwrite that newer state. Before the check was added, a
 
 ### Voting
 
-A node grants a vote only if the candidate's term is **strictly higher** than
-its own. Granting the vote also bumps its term to match, so a second candidate
-in the same term gets turned down. That's what limits each node to one vote
-per term, with no separate "voted" flag. A node that grants a vote also steps
-down to `Follower` if it wasn't one, and resets its heartbeat timer.
+A node grants a vote when three things hold:
+
+1. **The candidate's term is current.** An older term is refused; a newer one is
+   adopted first, which also steps the node down and clears its stored vote.
+2. **It hasn't already voted this term** — or it's the same candidate asking
+   again, so a retried request doesn't lose a vote it already granted. The vote
+   is written to `raft-state.bin` and `fsync`ed *before* the reply goes out, so
+   a crash can't let the node vote twice in one term.
+3. **The candidate's log is at least as complete as its own** — a later last
+   term wins, and on a tie the longer log wins.
+
+That third rule is the election restriction, and it's what keeps
+acknowledged writes safe. A write is acknowledged once a majority holds it, so
+any majority — and therefore any winning candidate — must contain at least one
+node that has it. Without the check, a node missing committed entries could win
+and overwrite them, and the `Ok` the client already saw would have been a lie.
+
+A node that grants a vote also resets its heartbeat timer.
 
 ### When an election fails
 
@@ -273,8 +308,8 @@ The rule "if you see a higher term, adopt it and become a `Follower`" lives in
 a single helper, `adopt_term_if_newer`, which runs in three places:
 
 - when a node receives a `RequestVote`
-- when a node receives a `Heartbeat`
-- when the leader reads back a `HeartbeatAck`
+- when a node receives an `AppendEntries`
+- when the leader reads back an `AppendEntriesAck`
 
 ### Timeouts at a glance
 
@@ -322,19 +357,61 @@ Starting election for term 2.
 
 ## Replication
 
-When the leader handles a `Set`, it writes the value locally and then sends
-the same `Set` to every peer, each over its own connection in a background
-task. It replies `Ok` to the client right away, without waiting for any peer.
-If a peer can't be reached, the failure is logged and never retried.
+The WAL is the Raft log: every record is a `LogEntry { term, index, command }`,
+indexed from 1. Writes and reads both go through the leader; a follower asked
+for either replies `NotLeader { leader }` with the leader's address, and the
+bundled client follows that redirect.
 
-This is best-effort replication, not Raft's log replication. See the
-limitations below for what that means in practice.
+### Committing a write
+
+1. The leader appends the entry to its own log and `fsync`s it.
+2. It sends the entry to every peer in an `AppendEntries`, alongside the index
+   and term of the entry immediately before it.
+3. A peer appends only if its own log matches at that preceding entry. That
+   check, applied inductively, means a matching entry implies matching history.
+4. Once a majority (the leader included) holds the entry, it is **committed**:
+   the leader applies it to the map and only then replies `Ok`.
+
+If the entry doesn't commit within two seconds, the client gets an error saying
+so — worded as *unknown*, not *failed*, because the entry may still commit
+afterwards. That is the honest answer; claiming either outcome would be a guess.
+
+### Catching a node up
+
+The leader keeps a `nextIndex` per peer, guessed optimistically at its own last
+index plus one. A peer that disagrees replies with the first index of the term
+they disagree on, so the leader backs up a whole term per round trip rather than
+one entry at a time, then ships everything from there. A node that was down for
+a thousand writes catches up on its own, in batches of 64, with nothing to
+replay by hand.
+
+If a peer holds entries the cluster never committed — a partitioned leader that
+accepted writes it could never replicate — those entries conflict with the real
+leader's, and the follower truncates them before appending the real ones. They
+were never acknowledged to any client, so nothing that was promised is lost.
+
+### Why the leader writes a no-op when it's elected
+
+Raft only lets a leader commit an entry from its *own* term by counting
+replicas; an older entry can sit on a majority and still not be committed. So a
+new leader appends one empty entry of its own term immediately. Committing that
+commits everything before it, which would otherwise wait for the next client
+write that might never come.
 
 ## Client
 
-`client.rs` connects to `0.0.0.0:7878`, sends 100 concurrent `Set`s followed by
-one `Get`, and prints the responses. It's for putting load on a server, not
-for building on as a client library.
+`client.rs` is a small command-line client, and the demo uses it to read and
+write inside the cluster network:
+
+```bash
+client <addr> set <key> <value>
+client <addr> get <key>
+client                          # load test: 100 concurrent Sets, then one Get
+```
+
+It follows a `NotLeader` redirect once, so pointing it at any node works. It is
+a testing tool, not a client library: no connection reuse, no retry policy, no
+batching.
 
 ## Deployment
 
@@ -351,9 +428,39 @@ directory, which is what keeps `wal.log` around across restarts and redeploys.
 
 ## Known limitations
 
-Leader election is in reasonable shape, and a node now survives a crash without
-losing acknowledged writes or forgetting its vote. The data path still isn't
-Raft, and the gaps below come from that.
+An acknowledged write now survives any single node dying, and a node that was
+down rejoins and converges on its own. What's left is mostly about scale and
+operations rather than correctness.
+
+- **The log is never compacted.** `wal.log` grows without bound and is replayed
+  in full on every boot. No snapshotting, so catching up a node that was down
+  for a long time means shipping every entry it missed.
+- **Cluster membership is fixed.** `PEERS` is read once at startup. Adding or
+  removing a node means restarting the cluster, and there's no joint-consensus
+  configuration change.
+- **Reads are leader-local, not linearizable.** A leader that has just been
+  partitioned off doesn't know it yet and will keep answering reads from its own
+  map for up to an election timeout. Fixing it properly needs a read index or a
+  leader lease.
+- **One `fsync` per write, no group commit.** Concurrent writes each pay their
+  own flush instead of sharing one.
+- **A write that times out is reported as unknown.** That's honest, but there's
+  no request ID or dedup, so a client that retries can apply the same write
+  twice. Writes are idempotent per key, so this is survivable, not correct.
+- **In the 2-node laptop+Pi deployment, nothing commits while either node is
+  down.** A majority of two is two. That's correct Raft, not a bug, but it means
+  that topology has no fault tolerance for writes — it needs a third node.
+- **`deploy_pi.sh` sets no `PEERS`,** so the Pi believes it's a single-node
+  cluster and elects itself leader of its own term, independently of the laptop.
+  Pre-existing, and worth fixing before trusting that deployment.
+
+Older gaps, now closed: writes acknowledged before replication, log entries
+without a term or index, no election restriction, nodes that never caught up,
+replicated writes arriving out of order, followers accepting client writes,
+non-durable terms, and a torn WAL record crashing startup.
+
+<details>
+<summary>The former list, for reference</summary>
 
 - **Writes are acknowledged before they're replicated.** If the leader dies
   right after replying `Ok`, the write may exist only on the old leader.
@@ -370,7 +477,9 @@ Raft, and the gaps below come from that.
 - **Followers accept writes from clients** and apply them locally without
   forwarding them to the leader.
 - **Reads can be stale,** because any node answers `Get` from its own data.
-- **The log is never compacted.** `wal.log` grows without bound and is replayed
-  in full on every boot; there's no snapshotting.
+- **A half-written WAL record crashes startup.**
+- **`flush()` isn't `fsync`,** so a power loss can drop recent writes.
+
+</details>
 - **The WAL is never compacted.** It grows forever and is fully replayed on
   every boot.

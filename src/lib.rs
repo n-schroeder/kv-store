@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
 use tokio::fs::{OpenOptions, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 
 /// Magic bytes plus format version at the head of every WAL file. The trailing
 /// byte is the version. Pre-checksum logs (v1) had no header at all, so their
@@ -300,58 +299,256 @@ impl RaftStateStore {
     }
 }
 
-#[derive(Clone)]
-pub struct KvStore {
-    db: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    wal: Arc<Mutex<Wal>>,
+/// One entry in the replicated log. `index` is 1-based; index 0 is the "empty
+/// log" sentinel that `prev_log_index` uses to mean "nothing before this".
+///
+/// `term` and `index` live here, inside the WAL record's payload, rather than in
+/// the record frame: recovery decodes every record anyway, and [`RaftLog`] keeps
+/// an in-memory offset per index, so nothing needs these fields before decoding.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub term: u64,
+    pub index: u64,
+    pub command: Command,
 }
 
-impl KvStore {
+/// What a follower did with an `AppendEntries`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppendOutcome {
+    /// The entries are in the log; `match_index` is the last index held.
+    Accepted { match_index: u64 },
+    /// The log doesn't match at `prev_log_index`. `conflict_index` is where the
+    /// leader should try again, so it can back up by a whole term at a time
+    /// instead of one index per round trip.
+    Conflict { conflict_index: u64 },
+}
+
+/// The replicated log: the WAL, read as a sequence of [`LogEntry`]s.
+pub struct RaftLog {
+    wal: Wal,
+    entries: Vec<LogEntry>,
+    /// Byte offset of each entry's record, parallel to `entries`. This is what
+    /// lets a truncation turn an index back into a file position.
+    offsets: Vec<u64>,
+}
+
+impl RaftLog {
+    /// Opens the log at `path`, replaying it into memory.
+    ///
+    /// On top of the frame-level CRC check, this validates that indexes run
+    /// 1, 2, 3, … with no gaps and that terms never decrease, truncating at the
+    /// first entry that breaks either rule. That check is not redundant with the
+    /// checksum: if we truncate a diverged suffix and crash before the
+    /// replacement entry is written — or write a shorter one that doesn't cover
+    /// all the old bytes — the leftover records are *intact*, correct CRC and
+    /// all. Only their indexes give them away.
     pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let (wal, records) = Wal::open(path).await?;
+        let (mut wal, records) = Wal::open(path).await?;
 
-        let mut store = HashMap::new();
+        let mut entries: Vec<LogEntry> = Vec::with_capacity(records.len());
+        let mut offsets: Vec<u64> = Vec::with_capacity(records.len());
+        let mut truncate_at: Option<(u64, String)> = None;
+
         for record in &records {
-            let cmd: Command = bincode::deserialize(&record.payload).map_err(|e| {
-                io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "{}: record at offset {} passed its checksum but could not be decoded: {}",
-                        wal.path().display(),
-                        record.offset,
-                        e
-                    ),
-                )
-            })?;
+            let entry: LogEntry = match bincode::deserialize(&record.payload) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    truncate_at = Some((record.offset, format!("undecodable record ({})", e)));
+                    break;
+                }
+            };
 
-            if let Command::Set { key, value } = cmd {
-                store.insert(key, value);
+            let expected_index = entries.len() as u64 + 1;
+            if entry.index != expected_index {
+                truncate_at = Some((
+                    record.offset,
+                    format!("expected index {}, found {}", expected_index, entry.index),
+                ));
+                break;
+            }
+
+            if let Some(previous) = entries.last() {
+                if entry.term < previous.term {
+                    truncate_at = Some((
+                        record.offset,
+                        format!("term went backwards ({} after {})", entry.term, previous.term),
+                    ));
+                    break;
+                }
+            }
+
+            entries.push(entry);
+            offsets.push(record.offset);
+        }
+
+        if let Some((offset, reason)) = truncate_at {
+            println!(
+                "WAL: dropping entries from index {} on — {}. This is what a crash \
+                 during a log truncation looks like.",
+                entries.len() as u64 + 1,
+                reason
+            );
+            wal.truncate_from(offset).await?;
+        }
+
+        println!("Log restored: {} entries, last term {}.",
+            entries.len(),
+            entries.last().map(|e| e.term).unwrap_or(0));
+
+        Ok(RaftLog { wal, entries, offsets })
+    }
+
+    pub fn last_index(&self) -> u64 {
+        self.entries.len() as u64
+    }
+
+    pub fn last_term(&self) -> u64 {
+        self.entries.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    /// The term of the entry at `index`, or `Some(0)` for the index-0 sentinel.
+    pub fn term_at(&self, index: u64) -> Option<u64> {
+        if index == 0 {
+            return Some(0);
+        }
+        self.entries.get((index - 1) as usize).map(|e| e.term)
+    }
+
+    pub fn entry_at(&self, index: u64) -> Option<&LogEntry> {
+        if index == 0 {
+            return None;
+        }
+        self.entries.get((index - 1) as usize)
+    }
+
+    /// Up to `max` entries starting at `index`, for a leader to ship to a peer.
+    pub fn entries_from(&self, index: u64, max: usize) -> Vec<LogEntry> {
+        if index == 0 || index > self.last_index() {
+            return Vec::new();
+        }
+        let start = (index - 1) as usize;
+        let end = (start + max).min(self.entries.len());
+        self.entries[start..end].to_vec()
+    }
+
+    /// Is `other` at least as up to date as this log? Raft's election
+    /// restriction: a later last term wins, and on a tie the longer log wins.
+    /// Without it, a node missing committed entries could win an election and
+    /// overwrite them, which would make an acknowledged write a lie.
+    pub fn is_up_to_date(&self, other_last_term: u64, other_last_index: u64) -> bool {
+        match other_last_term.cmp(&self.last_term()) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => other_last_index >= self.last_index(),
+        }
+    }
+
+    /// Appends a new command as the leader, returning the index it landed at.
+    pub async fn append_command(&mut self, term: u64, command: Command) -> io::Result<u64> {
+        let index = self.last_index() + 1;
+        let entry = LogEntry { term, index, command };
+        self.append_one(entry).await?;
+        Ok(index)
+    }
+
+    async fn append_one(&mut self, entry: LogEntry) -> io::Result<()> {
+        let payload = bincode::serialize(&entry).map_err(|e| {
+            io::Error::new(ErrorKind::InvalidData, format!("cannot serialize log entry: {}", e))
+        })?;
+        let offset = self.wal.append(&payload).await?;
+        self.entries.push(entry);
+        self.offsets.push(offset);
+        Ok(())
+    }
+
+    /// The follower side of `AppendEntries`: check that our log matches the
+    /// leader's at `prev_log_index`, then take the entries.
+    pub async fn try_append(
+        &mut self,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: &[LogEntry],
+    ) -> io::Result<AppendOutcome> {
+        // We're simply missing entries the leader assumes we have.
+        if prev_log_index > self.last_index() {
+            return Ok(AppendOutcome::Conflict { conflict_index: self.last_index() + 1 });
+        }
+
+        if let Some(our_term) = self.term_at(prev_log_index) {
+            if our_term != prev_log_term {
+                // Back the leader up past every entry of the term we disagree
+                // on, rather than one index per round trip.
+                let mut conflict_index = prev_log_index;
+                while conflict_index > 1 && self.term_at(conflict_index - 1) == Some(our_term) {
+                    conflict_index -= 1;
+                }
+                return Ok(AppendOutcome::Conflict { conflict_index });
             }
         }
 
-        println!("Database booted. Restored {} keys from WAL.", store.len());
+        // Skip entries we already hold, so a duplicate or delayed AppendEntries
+        // can't truncate a suffix that is actually fine — possibly a committed
+        // one. Only a genuine term mismatch truncates.
+        let mut first_new = 0;
+        while first_new < entries.len() {
+            let entry = &entries[first_new];
+            match self.term_at(entry.index) {
+                Some(existing_term) if existing_term == entry.term => first_new += 1,
+                Some(existing_term) => {
+                    println!(
+                        "Truncating diverged log from index {} (ours term {}, leader's term {}).",
+                        entry.index, existing_term, entry.term
+                    );
+                    self.truncate_from(entry.index).await?;
+                    break;
+                }
+                None => break,
+            }
+        }
 
-        Ok(KvStore {
-            db: Arc::new(RwLock::new(store)),
-            wal: Arc::new(Mutex::new(wal)),
+        for entry in &entries[first_new..] {
+            self.append_one(entry.clone()).await?;
+        }
+
+        Ok(AppendOutcome::Accepted {
+            match_index: prev_log_index + entries.len() as u64,
         })
     }
 
-    pub async fn set(&self, key: String, value: Vec<u8>) -> io::Result<()> {
-        let cmd = Command::Set { key: key.clone(), value: value.clone() };
+    /// Drops every entry from `index` on, both in memory and on disk.
+    pub async fn truncate_from(&mut self, index: u64) -> io::Result<()> {
+        if index == 0 || index > self.last_index() {
+            return Ok(());
+        }
+        let position = (index - 1) as usize;
+        let offset = self.offsets[position];
 
-        let payload = bincode::serialize(&cmd).map_err(|e| {
-            io::Error::new(ErrorKind::InvalidData, format!("cannot serialize Set: {}", e))
-        })?;
-
-        let mut wal = self.wal.lock().await;
-        wal.append(&payload).await?;
-        drop(wal);
-
-        let mut store = self.db.write().unwrap();
-        store.insert(key, value);
-
+        self.wal.truncate_from(offset).await?;
+        self.entries.truncate(position);
+        self.offsets.truncate(position);
         Ok(())
+    }
+}
+
+/// The state machine the log is applied into: an in-memory map, and nothing
+/// else. It is deliberately *not* durable — the log is the durable thing, and
+/// this is only ever a replay of the log's committed prefix.
+#[derive(Clone, Default)]
+pub struct KvStore {
+    db: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+}
+
+impl KvStore {
+    pub fn new() -> Self {
+        KvStore { db: Arc::new(RwLock::new(HashMap::new())) }
+    }
+
+    /// Applies a committed command. Only `Set` changes anything; reads and Raft
+    /// RPCs are ignored, so a log that carries them replays harmlessly.
+    pub fn apply(&self, command: &Command) {
+        if let Command::Set { key, value } = command {
+            self.db.write().unwrap().insert(key.clone(), value.clone());
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
@@ -373,8 +570,25 @@ impl KvStore {
 pub enum Command {
     Set { key: String, value: Vec<u8> },
     Get { key: String },
-    Heartbeat { term: u64 },
-    RequestVote { term: u64, candidate_id: String },
+    /// A leader's first entry in a new term. It carries no data; it exists so
+    /// the commit rule has an entry of the current term to latch onto, which is
+    /// what lets entries inherited from earlier terms commit.
+    NoOp,
+    /// Replication and heartbeat in one. An empty `entries` is a heartbeat.
+    AppendEntries {
+        term: u64,
+        leader_id: String,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    },
+    RequestVote {
+        term: u64,
+        candidate_id: String,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -383,7 +597,16 @@ pub enum Response {
     Value(Option<Vec<u8>>),
     Error(String),
     VoteResponse { term: u64, vote_granted: bool },
-    HeartbeatAck { term: u64 },
+    AppendEntriesAck {
+        term: u64,
+        success: bool,
+        /// On success, the last index the follower now holds.
+        match_index: u64,
+        /// On failure, the index the leader should retry from.
+        conflict_index: u64,
+    },
+    /// This node isn't the leader. `leader` is its dialable address if known.
+    NotLeader { leader: Option<String> },
 }
 
 #[cfg(test)]
@@ -569,20 +792,161 @@ mod tests {
         assert_eq!(payloads(&records), vec![b"after recovery".to_vec()]);
     }
 
+    fn set(key: &str, value: u8) -> Command {
+        Command::Set { key: key.to_string(), value: vec![value] }
+    }
+
     #[tokio::test]
-    async fn kv_store_restores_keys_across_a_reopen() {
-        let path = TempPath::new("kvstore");
+    async fn raft_log_restores_entries_across_a_reopen() {
+        let path = TempPath::new("raftlog");
 
-        let store = KvStore::open(path.as_path()).await.unwrap();
-        store.set("a".to_string(), vec![1]).await.unwrap();
-        store.set("b".to_string(), vec![2]).await.unwrap();
-        store.set("a".to_string(), vec![3]).await.unwrap();
-        drop(store);
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        assert_eq!(log.last_index(), 0, "an empty log is at index 0");
+        assert_eq!(log.append_command(1, set("a", 1)).await.unwrap(), 1);
+        assert_eq!(log.append_command(1, set("b", 2)).await.unwrap(), 2);
+        assert_eq!(log.append_command(2, set("a", 3)).await.unwrap(), 3);
+        drop(log);
 
-        let store = KvStore::open(path.as_path()).await.unwrap();
+        let log = RaftLog::open(path.as_path()).await.unwrap();
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.last_term(), 2);
+        assert_eq!(log.term_at(1), Some(1));
+        assert_eq!(log.term_at(0), Some(0), "index 0 is the empty-log sentinel");
+
+        // Replaying the log into the state machine is how a node recovers.
+        let store = KvStore::new();
+        for i in 1..=log.last_index() {
+            store.apply(&log.entry_at(i).unwrap().command);
+        }
         assert_eq!(store.get("a"), Some(vec![3]), "last write for a key wins");
         assert_eq!(store.get("b"), Some(vec![2]));
         assert_eq!(store.get("missing"), None);
+    }
+
+    /// The failure a checksum cannot see. We truncate a diverged suffix and
+    /// crash before writing the replacement, so records that were logically
+    /// removed are still physically present and still checksum perfectly. Only
+    /// the index sequence gives them away.
+    #[tokio::test]
+    async fn raft_log_drops_a_stale_suffix_that_still_checksums() {
+        let path = TempPath::new("stale-suffix");
+
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        for i in 1..=10u8 {
+            log.append_command(1, set(&format!("key{}", i), i)).await.unwrap();
+        }
+        drop(log);
+
+        let intact = std::fs::read(path.as_path()).unwrap();
+
+        // Truncate back to 5 entries, then simulate the crash: put the original
+        // bytes for entries 6..10 back, exactly as they were on disk.
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        log.truncate_from(6).await.unwrap();
+        drop(log);
+
+        let truncated_len = std::fs::metadata(path.as_path()).unwrap().len() as usize;
+        std::fs::write(path.as_path(), &intact).unwrap();
+        assert!(intact.len() > truncated_len, "the stale bytes are really there");
+
+        // Every one of those records passes its CRC, so recovery has to catch
+        // this some other way: write a *new* entry 6 and check the leftovers go.
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        log.truncate_from(6).await.unwrap();
+        log.append_command(2, set("replacement", 99)).await.unwrap();
+        // Now paste the stale tail back on, as a crash mid-truncate would leave it.
+        let mut bytes = std::fs::read(path.as_path()).unwrap();
+        bytes.extend_from_slice(&intact[truncated_len..]);
+        std::fs::write(path.as_path(), &bytes).unwrap();
+        drop(log);
+
+        let log = RaftLog::open(path.as_path()).await.unwrap();
+        assert_eq!(log.last_index(), 6, "the resurrected entries are gone");
+        assert_eq!(log.last_term(), 2);
+        assert_eq!(
+            log.entry_at(6).unwrap().command,
+            set("replacement", 99),
+            "the replacement entry survived, the stale ones did not"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_append_truncates_a_conflicting_suffix() {
+        let path = TempPath::new("conflict");
+
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        log.append_command(1, set("a", 1)).await.unwrap();
+        log.append_command(1, set("b", 2)).await.unwrap();
+        log.append_command(1, set("c", 3)).await.unwrap();
+
+        // A new leader in term 2 disagrees about index 2 onward.
+        let replacement = vec![
+            LogEntry { term: 2, index: 2, command: set("b", 99) },
+            LogEntry { term: 2, index: 3, command: set("c", 98) },
+        ];
+        let outcome = log.try_append(1, 1, &replacement).await.unwrap();
+
+        assert_eq!(outcome, AppendOutcome::Accepted { match_index: 3 });
+        assert_eq!(log.entry_at(2).unwrap().command, set("b", 99));
+        assert_eq!(log.last_term(), 2);
+    }
+
+    #[tokio::test]
+    async fn try_append_is_idempotent_for_entries_we_already_have() {
+        let path = TempPath::new("duplicate");
+
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        log.append_command(1, set("a", 1)).await.unwrap();
+        log.append_command(1, set("b", 2)).await.unwrap();
+        log.append_command(1, set("c", 3)).await.unwrap();
+
+        // A delayed retransmission of entries we already hold must not truncate
+        // the entries after them — those may already be committed.
+        let already_have = vec![LogEntry { term: 1, index: 2, command: set("b", 2) }];
+        let outcome = log.try_append(1, 1, &already_have).await.unwrap();
+
+        assert_eq!(outcome, AppendOutcome::Accepted { match_index: 2 });
+        assert_eq!(log.last_index(), 3, "entry 3 was not truncated away");
+        assert_eq!(log.entry_at(3).unwrap().command, set("c", 3));
+    }
+
+    #[tokio::test]
+    async fn try_append_reports_where_to_back_up_to() {
+        let path = TempPath::new("backup");
+
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+
+        // A follower that is simply behind asks for the next index it needs.
+        let outcome = log.try_append(5, 3, &[]).await.unwrap();
+        assert_eq!(outcome, AppendOutcome::Conflict { conflict_index: 1 });
+
+        // A follower holding a whole term the leader doesn't have should send
+        // the leader back past all of it at once, not one index per round trip.
+        for _ in 0..4 {
+            log.append_command(4, set("x", 0)).await.unwrap();
+        }
+        let outcome = log.try_append(4, 9, &[]).await.unwrap();
+        assert_eq!(
+            outcome,
+            AppendOutcome::Conflict { conflict_index: 1 },
+            "back up past every entry of the disputed term"
+        );
+    }
+
+    #[tokio::test]
+    async fn election_restriction_compares_logs() {
+        let path = TempPath::new("uptodate");
+
+        let mut log = RaftLog::open(path.as_path()).await.unwrap();
+        log.append_command(1, set("a", 1)).await.unwrap();
+        log.append_command(2, set("b", 2)).await.unwrap();
+        // Our log: last term 2, last index 2.
+
+        assert!(log.is_up_to_date(2, 2), "an identical log qualifies");
+        assert!(log.is_up_to_date(2, 5), "same term, longer log qualifies");
+        assert!(log.is_up_to_date(3, 1), "a later term wins even if shorter");
+        assert!(!log.is_up_to_date(2, 1), "same term, shorter log is behind");
+        assert!(!log.is_up_to_date(1, 9), "an earlier last term loses at any length");
     }
 
     #[tokio::test]
